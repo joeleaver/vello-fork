@@ -8,7 +8,14 @@ use std::collections::hash_map::Entry;
 
 const DEFAULT_ATLAS_SIZE: i32 = 1024;
 const MAX_ATLAS_SIZE: i32 = 8192;
-const EVICT_AFTER_GENERATIONS: u64 = 2;
+/// How many resolves an image must have gone unused before its atlas space can
+/// be taken for an image that does not fit. rinch-patch: 0, i.e. any image the
+/// current resolve has not drawn. Atlas writes for a resolve are recorded
+/// before the dispatches that read them, after every earlier resolve's
+/// commands, so reusing an older image's space is safe, and the atlas then
+/// only has to hold one scene's images (upstream: 2, three scenes' worth, so
+/// an app that re-encodes its images with new blobs each frame lost them).
+const EVICT_AFTER_GENERATIONS: u64 = 0;
 
 #[derive(Default)]
 pub struct Images<'a> {
@@ -86,6 +93,20 @@ impl ImageCache {
             if resident.last_used_generation == self.generation {
                 resident.last_used_generation = previous_generation;
             }
+        }
+    }
+
+    /// The atlas size with nothing to upload, for a resolve with no images.
+    /// rinch-patch: a patch-less scene used to report `Images::default()`
+    /// (size 0), which made the renderer replace the persistent atlas texture
+    /// with a 1x1 one and the next render replace that with an empty one,
+    /// while the cache still believed its resident images were uploaded.
+    pub(crate) fn images_without_uploads(&self) -> Images<'_> {
+        Images {
+            width: self.atlas.size().width as u32,
+            height: self.atlas.size().height as u32,
+            evicted: 0,
+            images: &[],
         }
     }
 
@@ -329,6 +350,38 @@ mod tests {
 
         assert!(cache.evict_stale_entries());
         assert!(!cache.evict_stale_entries());
+    }
+
+    /// rinch-patch: an image the previous resolve drew, and this one does
+    /// not, gives up its space to one that does not fit otherwise.
+    #[test]
+    fn an_image_unused_by_this_resolve_is_evicted_under_pressure() {
+        let mut cache = ImageCache::new_with_sizes(16, 16);
+        let image_a = image(1, 12, 12);
+        let image_b = image(2, 12, 12);
+
+        cache.begin_resolve();
+        assert!(cache.get_or_insert(&image_a).is_some());
+        cache.finish_resolve();
+
+        cache.begin_resolve();
+        assert!(cache.get_or_insert(&image_b).is_none());
+        assert!(cache.evict_stale_entries());
+        assert!(cache.get_or_insert(&image_b).is_some());
+        assert!(!cache.map.contains_key(&image_a.data.id()));
+    }
+
+    /// rinch-patch: a resolve with no images reports the atlas as it is,
+    /// with nothing to upload, so the renderer keeps the atlas texture.
+    #[test]
+    fn a_resolve_without_images_keeps_the_atlas_size() {
+        let mut cache = ImageCache::new_with_sizes(16, 64);
+        cache.begin_resolve();
+        assert!(cache.get_or_insert(&image(1, 12, 12)).is_some());
+        cache.finish_resolve();
+        let images = cache.images_without_uploads();
+        assert_eq!((images.width, images.height), (16, 16));
+        assert!(images.images.is_empty());
     }
 
     #[test]

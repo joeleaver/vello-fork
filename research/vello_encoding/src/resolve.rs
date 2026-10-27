@@ -188,7 +188,11 @@ impl Resolver {
         let resources = &encoding.resources;
         if resources.patches.is_empty() {
             let layout = resolve_solid_paths_only(encoding, packed);
-            return (layout, Ramps::default(), Images::default());
+            return (
+                layout,
+                Ramps::default(),
+                self.image_cache.images_without_uploads(),
+            );
         }
         let patch_sizes = self.resolve_patches(encoding);
         self.resolve_pending_images();
