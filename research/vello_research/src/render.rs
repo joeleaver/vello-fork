@@ -7,9 +7,6 @@ use crate::recording::{BufferProxy, ImageFormat, ImageProxy, Recording, Resource
 use crate::shaders::FullShaders;
 use crate::{AaConfig, RenderParams};
 
-#[cfg(feature = "wgpu")]
-use crate::Scene;
-
 use vello_encoding::{Encoding, Resolver, WorkgroupSize, make_mask_lut, make_mask_lut_16};
 
 #[derive(Clone, Copy, Debug)]
@@ -21,6 +18,12 @@ enum AtlasProxyAction {
 
 /// State for a render in progress.
 pub struct Render {
+    /// The least the bump-allocated buffers are given (a renderer grows it
+    /// after a frame overflowed them); `None` is Vello's own sizes.
+    pub(crate) bump_sizes: Option<vello_encoding::BumpSizes>,
+    /// The GPU config the coarse recording was made with, so the bump
+    /// counters read back after it can be judged against its sizes.
+    pub(crate) gpu_config: Option<vello_encoding::ConfigUniform>,
     fine_wg_count: Option<WorkgroupSize>,
     fine_resources: Option<FineResources>,
     mask_buf: Option<ResourceProxy>,
@@ -80,37 +83,6 @@ impl CapturedBuffers {
     }
 }
 
-#[cfg(feature = "wgpu")]
-pub(crate) fn render_full(
-    scene: &Scene,
-    resolver: &mut Resolver,
-    shaders: &FullShaders,
-    image_atlas: &mut Option<ImageProxy>,
-    params: &RenderParams,
-) -> (Recording, ResourceProxy) {
-    render_encoding_full(scene.encoding(), resolver, shaders, image_atlas, params)
-}
-
-#[cfg(feature = "wgpu")]
-/// Create a single recording with both coarse and fine render stages.
-///
-/// This function is not recommended when the scene can be complex, as it does not
-/// implement robust dynamic memory.
-pub(crate) fn render_encoding_full(
-    encoding: &Encoding,
-    resolver: &mut Resolver,
-    shaders: &FullShaders,
-    image_atlas: &mut Option<ImageProxy>,
-    params: &RenderParams,
-) -> (Recording, ResourceProxy) {
-    let mut render = Render::new();
-    let mut recording =
-        render.render_encoding_coarse(encoding, resolver, shaders, image_atlas, params, false);
-    let out_image = render.out_image();
-    render.record_fine(shaders, &mut recording);
-    (recording, out_image.into())
-}
-
 impl Default for Render {
     fn default() -> Self {
         Self::new()
@@ -120,6 +92,8 @@ impl Default for Render {
 impl Render {
     pub fn new() -> Self {
         Self {
+            bump_sizes: None,
+            gpu_config: None,
             fine_wg_count: None,
             fine_resources: None,
             mask_buf: None,
@@ -203,6 +177,11 @@ impl Render {
         }
         let cpu_config =
             RenderConfig::new(&layout, params.width, params.height, &params.base_color);
+        let cpu_config = match &self.bump_sizes {
+            Some(min) => cpu_config.with_bump_sizes(min),
+            None => cpu_config,
+        };
+        self.gpu_config = Some(cpu_config.gpu);
         // HACK: The coarse workgroup counts is the number of active bins.
         if (cpu_config.workgroup_counts.coarse.0
             * cpu_config.workgroup_counts.coarse.1
