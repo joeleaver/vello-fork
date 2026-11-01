@@ -431,7 +431,7 @@ impl Default for RendererOptions {
 /// A split frame counts each of its slices, the later slices being the ones
 /// that find the queue full.
 #[cfg(feature = "wgpu")]
-const MAX_BUMP_READBACKS: usize = 3;
+const MAX_BUMP_READBACKS: usize = 16;
 
 /// A frame's allocation counters on their way back from the GPU. Dropping this
 /// frees the download.
