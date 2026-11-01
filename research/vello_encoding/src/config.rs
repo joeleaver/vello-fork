@@ -209,7 +209,12 @@ impl RenderConfig {
         let sizes = &mut self.buffer_sizes;
         let bin_data_start = self.gpu.layout.bin_data_start;
         sizes.lines = BufferSize::new(sizes.lines.len().max(min.lines));
-        sizes.bin_data = BufferSize::new(sizes.bin_data.len().max(bin_data_start.saturating_add(min.binning)));
+        sizes.bin_data = BufferSize::new(
+            sizes
+                .bin_data
+                .len()
+                .max(bin_data_start.saturating_add(min.binning)),
+        );
         sizes.tiles = BufferSize::new(sizes.tiles.len().max(min.tiles));
         sizes.seg_counts = BufferSize::new(sizes.seg_counts.len().max(min.seg_counts));
         sizes.segments = BufferSize::new(sizes.segments.len().max(min.segments));
@@ -280,8 +285,13 @@ impl BumpSizes {
         if bump.failed == 0 {
             return had;
         }
-        let ptcl_static = g.width_in_tiles.saturating_mul(g.height_in_tiles).saturating_mul(PTCL_INITIAL_ALLOC);
-        let cap = |elem_bytes: usize| (max_bytes / elem_bytes as u64).min(u32::MAX as u64) as u32;
+        let ptcl_static = g
+            .width_in_tiles
+            .saturating_mul(g.height_in_tiles)
+            .saturating_mul(PTCL_INITIAL_ALLOC);
+        // `BufferSize` counts bytes in a `u32`.
+        let max_bytes = max_bytes.min(u32::MAX as u64);
+        let cap = |elem_bytes: usize| (max_bytes / elem_bytes as u64) as u32;
         let grow = |have: u32, wanted: u32, failed: bool, elem_bytes: usize| -> u32 {
             let target = if wanted > have {
                 wanted.saturating_add(wanted / 4)
@@ -292,18 +302,60 @@ impl BumpSizes {
             };
             target.min(cap(elem_bytes)).max(have)
         };
+        // `binning` is the part of `bin_data` past its info, which the limit
+        // on the buffer also has to hold.
+        let bin_data_start = g.layout.bin_data_start;
+        let cap_binning = cap(size_of::<u32>())
+            .saturating_sub(bin_data_start)
+            .max(had.binning);
         let f = bump.failed;
         let coarse = f & STAGE_COARSE != 0;
-        let seg_counts = grow(had.seg_counts, bump.seg_counts, f & STAGE_PATH_COUNT != 0, size_of::<SegmentCount>());
+        let seg_counts = grow(
+            had.seg_counts,
+            bump.seg_counts,
+            f & STAGE_PATH_COUNT != 0,
+            size_of::<SegmentCount>(),
+        );
         Self {
-            lines: grow(had.lines, bump.lines, f & STAGE_FLATTEN != 0, size_of::<LineSoup>()),
-            binning: grow(had.binning, bump.binning, f & STAGE_BINNING != 0, size_of::<u32>()),
-            tiles: grow(had.tiles, bump.tile, f & STAGE_TILE_ALLOC != 0, size_of::<Tile>()),
+            lines: grow(
+                had.lines,
+                bump.lines,
+                f & STAGE_FLATTEN != 0,
+                size_of::<LineSoup>(),
+            ),
+            binning: grow(
+                had.binning,
+                bump.binning,
+                f & STAGE_BINNING != 0,
+                size_of::<u32>(),
+            )
+            .min(cap_binning),
+            tiles: grow(
+                had.tiles,
+                bump.tile,
+                f & STAGE_TILE_ALLOC != 0,
+                size_of::<Tile>(),
+            ),
             seg_counts,
             // Segments are allocated one per counted segment.
-            segments: grow(had.segments, bump.segments.max(seg_counts), false, size_of::<PathSegment>()),
-            blend: grow(had.blend, bump.blend, coarse && bump.blend > had.blend, size_of::<u32>()),
-            ptcl: grow(had.ptcl, ptcl_static.saturating_add(bump.ptcl), coarse, size_of::<u32>()),
+            segments: grow(
+                had.segments,
+                bump.segments.max(seg_counts),
+                false,
+                size_of::<PathSegment>(),
+            ),
+            blend: grow(
+                had.blend,
+                bump.blend,
+                coarse && bump.blend > had.blend,
+                size_of::<u32>(),
+            ),
+            ptcl: grow(
+                had.ptcl,
+                ptcl_static.saturating_add(bump.ptcl),
+                coarse,
+                size_of::<u32>(),
+            ),
         }
     }
 }
@@ -563,10 +615,18 @@ mod bump_sizes_tests {
     fn an_overflowed_stage_grows_to_what_it_asked_for_with_room_to_spare() {
         let g = config(3840, 2160);
         let had = BumpSizes::of(&g);
-        let bump = BumpAllocators { failed: STAGE_TILE_ALLOC, tile: 6_645_984, lines: 1600, ..Default::default() };
+        let bump = BumpAllocators {
+            failed: STAGE_TILE_ALLOC,
+            tile: 6_645_984,
+            lines: 1600,
+            ..Default::default()
+        };
         let grown = BumpSizes::grown_for(&g, &bump, u64::MAX);
         assert_eq!(grown.tiles, 6_645_984 + 6_645_984 / 4);
-        assert_eq!(grown.lines, had.lines, "a stage that did not fail keeps its size");
+        assert_eq!(
+            grown.lines, had.lines,
+            "a stage that did not fail keeps its size"
+        );
         assert_eq!(grown.binning, had.binning);
         // A config with the grown sizes says so to the shaders.
         let mut rc = RenderConfig::new(&Layout::default(), 3840, 2160, &peniko::Color::WHITE);
@@ -581,16 +641,48 @@ mod bump_sizes_tests {
         let g = config(1920, 1080);
         let had = BumpSizes::of(&g);
         // Coarse gave up: ptcl counted only what it reached.
-        let bump = BumpAllocators { failed: STAGE_COARSE | STAGE_PATH_COUNT, ..Default::default() };
+        let bump = BumpAllocators {
+            failed: STAGE_COARSE | STAGE_PATH_COUNT,
+            ..Default::default()
+        };
         let grown = BumpSizes::grown_for(&g, &bump, u64::MAX);
         assert_eq!(grown.ptcl, had.ptcl * 2);
         assert_eq!(grown.seg_counts, had.seg_counts * 2);
-        assert!(grown.segments >= grown.seg_counts, "a segment per counted segment");
+        assert!(
+            grown.segments >= grown.seg_counts,
+            "a segment per counted segment"
+        );
         // At the device's limit nothing can grow: the sizes come back unchanged.
         let limit = had.tiles as u64 * size_of::<Tile>() as u64;
-        let bump = BumpAllocators { failed: STAGE_TILE_ALLOC, tile: had.tiles * 3, ..Default::default() };
+        let bump = BumpAllocators {
+            failed: STAGE_TILE_ALLOC,
+            tile: had.tiles * 3,
+            ..Default::default()
+        };
         assert_eq!(BumpSizes::grown_for(&g, &bump, limit).tiles, had.tiles);
+        // The limit holds `bin_data` whole, its info included.
+        let limit = (g.layout.bin_data_start as u64 + had.binning as u64 * 2) * 4;
+        let bump = BumpAllocators {
+            failed: STAGE_BINNING,
+            binning: had.binning * 3,
+            ..Default::default()
+        };
+        assert_eq!(
+            BumpSizes::grown_for(&g, &bump, limit).binning,
+            had.binning * 2
+        );
+        // The sizes count bytes in a `u32`, whatever the device allows.
+        let bump = BumpAllocators {
+            failed: STAGE_TILE_ALLOC,
+            tile: u32::MAX,
+            ..Default::default()
+        };
+        let tiles = BumpSizes::grown_for(&g, &bump, u64::MAX).tiles as u64;
+        assert!(tiles * size_of::<Tile>() as u64 <= u32::MAX as u64);
         // A frame that did not fail changes nothing.
-        assert_eq!(BumpSizes::grown_for(&g, &BumpAllocators::default(), u64::MAX), had);
+        assert_eq!(
+            BumpSizes::grown_for(&g, &BumpAllocators::default(), u64::MAX),
+            had
+        );
     }
 }

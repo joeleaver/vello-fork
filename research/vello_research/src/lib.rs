@@ -491,7 +491,9 @@ impl Renderer {
         let robust = !self.options.use_cpu && !cfg!(target_arch = "wasm32");
         let max_bytes = {
             let limits = device.limits();
-            limits.max_storage_buffer_binding_size.min(limits.max_buffer_size)
+            limits
+                .max_storage_buffer_binding_size
+                .min(limits.max_buffer_size)
         };
         for attempt in 0..4 {
             let mut render = Render::new();
@@ -567,7 +569,11 @@ impl Renderer {
     /// `bump_buf` (scheduled for download by a robust recording), waiting for
     /// the GPU. `None` when the download is not there or cannot be mapped.
     #[cfg(not(target_arch = "wasm32"))]
-    fn read_bump(&mut self, device: &Device, buf: recording::BufferProxy) -> Option<BumpAllocators> {
+    fn read_bump(
+        &mut self,
+        device: &Device,
+        buf: recording::BufferProxy,
+    ) -> Option<BumpAllocators> {
         let bump = {
             let download = self.engine.get_download(buf)?;
             let slice = download.slice(..);
@@ -579,7 +585,8 @@ impl Renderer {
             match receiver.recv() {
                 Ok(Ok(())) => {
                     let mapped = slice.get_mapped_range().ok()?;
-                    let bump: BumpAllocators = bytemuck::pod_read_unaligned(&mapped[..size_of::<BumpAllocators>()]);
+                    let bump: BumpAllocators =
+                        bytemuck::pod_read_unaligned(&mapped[..size_of::<BumpAllocators>()]);
                     drop(mapped);
                     download.unmap();
                     Some(bump)
@@ -592,7 +599,11 @@ impl Renderer {
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn read_bump(&mut self, _device: &Device, _bump_buf: recording::BufferProxy) -> Option<BumpAllocators> {
+    fn read_bump(
+        &mut self,
+        _device: &Device,
+        _bump_buf: recording::BufferProxy,
+    ) -> Option<BumpAllocators> {
         None
     }
 
