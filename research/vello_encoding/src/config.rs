@@ -358,6 +358,53 @@ impl BumpSizes {
             ),
         }
     }
+
+    /// What a frame recorded with config `g` used of each buffer, in the same
+    /// terms as the sizes (the counters leave out the static part of the ptcl).
+    pub fn used(g: &ConfigUniform, bump: &BumpAllocators) -> Self {
+        let ptcl_static = g
+            .width_in_tiles
+            .saturating_mul(g.height_in_tiles)
+            .saturating_mul(PTCL_INITIAL_ALLOC);
+        Self {
+            lines: bump.lines,
+            binning: bump.binning,
+            tiles: bump.tile,
+            seg_counts: bump.seg_counts,
+            segments: bump.segments,
+            blend: bump.blend,
+            ptcl: ptcl_static.saturating_add(bump.ptcl),
+        }
+    }
+
+    /// Every field the larger of the two.
+    #[must_use]
+    pub fn at_least(self, other: Self) -> Self {
+        Self {
+            lines: self.lines.max(other.lines),
+            binning: self.binning.max(other.binning),
+            tiles: self.tiles.max(other.tiles),
+            seg_counts: self.seg_counts.max(other.seg_counts),
+            segments: self.segments.max(other.segments),
+            blend: self.blend.max(other.blend),
+            ptcl: self.ptcl.max(other.ptcl),
+        }
+    }
+
+    /// Whether these usages take any buffer of `sizes` past 3/4 of it and past
+    /// its entry in `high`, the most seen of it before.
+    pub(crate) fn nears_limit(&self, sizes: &Self, high: &Self) -> bool {
+        let near = |used: u32, size: u32, high: u32| {
+            used > high && u64::from(used) * 4 > u64::from(size) * 3
+        };
+        near(self.lines, sizes.lines, high.lines)
+            || near(self.binning, sizes.binning, high.binning)
+            || near(self.tiles, sizes.tiles, high.tiles)
+            || near(self.seg_counts, sizes.seg_counts, high.seg_counts)
+            || near(self.segments, sizes.segments, high.segments)
+            || near(self.blend, sizes.blend, high.blend)
+            || near(self.ptcl, sizes.ptcl, high.ptcl)
+    }
 }
 
 /// Type alias for a workgroup size.
