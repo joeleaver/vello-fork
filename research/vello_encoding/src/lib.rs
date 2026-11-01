@@ -30,6 +30,7 @@
 )]
 
 mod binning;
+mod bump_watch;
 mod clip;
 mod config;
 mod draw;
@@ -47,6 +48,7 @@ mod ramp_cache;
 mod resolve;
 
 pub use binning::BinHeader;
+pub use bump_watch::{BumpWatch, FrameShape};
 pub use clip::{Clip, ClipBbox, ClipBic, ClipElement};
 pub use config::{
     BufferSize, BufferSizes, BumpAllocatorMemory, BumpAllocators, BumpSizes, ConfigUniform,

@@ -155,12 +155,16 @@ use thiserror::Error;
 #[cfg(feature = "wgpu")]
 use debug::DebugLayers;
 #[cfg(feature = "wgpu")]
-use vello_encoding::{BumpAllocators, Resolver};
+use vello_encoding::{BumpAllocators, BumpWatch, ConfigUniform, FrameShape, Resolver};
 #[cfg(feature = "wgpu")]
 use wgpu_engine::{ExternalResource, WgpuEngine};
 
 #[cfg(feature = "wgpu")]
-use std::{num::NonZeroUsize, sync::atomic::AtomicBool};
+use std::{
+    collections::VecDeque,
+    num::NonZeroUsize,
+    sync::{Arc, OnceLock, atomic::AtomicBool},
+};
 #[cfg(feature = "wgpu")]
 use wgpu::{Device, Queue, TextureView};
 #[cfg(all(feature = "wgpu", feature = "wgpu-profiler"))]
@@ -330,6 +334,11 @@ pub struct Renderer {
     /// The least the bump-allocated buffers get, grown whenever a frame ran
     /// out of one (see [`Renderer::render_to_texture`]); it never shrinks.
     bump_sizes: vello_encoding::BumpSizes,
+    /// Which frames wait for their allocation counters.
+    bump_watch: BumpWatch,
+    /// The counters of frames that did not wait, oldest first, at most
+    /// [`MAX_BUMP_READBACKS`] of them.
+    bump_readbacks: VecDeque<BumpReadback>,
     #[cfg(feature = "debug_layers")]
     debug: debug::DebugRenderer,
     #[cfg(feature = "wgpu-profiler")]
@@ -417,6 +426,49 @@ impl Default for RendererOptions {
     }
 }
 
+/// How many frames' counters can be on their way back at once. A frame finding
+/// this many goes unread, so an overflow in it is neither grown for nor logged.
+/// A split frame counts each of its slices, the later slices being the ones
+/// that find the queue full.
+#[cfg(feature = "wgpu")]
+const MAX_BUMP_READBACKS: usize = 16;
+
+/// A frame's allocation counters on their way back from the GPU. Dropping this
+/// frees the download.
+#[cfg(feature = "wgpu")]
+struct BumpReadback {
+    download: wgpu::Buffer,
+    /// Set by the map callback: whether the download mapped.
+    mapped: Arc<OnceLock<bool>>,
+    /// The config the frame was recorded with.
+    config: ConfigUniform,
+}
+
+/// Starts mapping a download of a frame that has been submitted. The answer
+/// arrives when the device is next polled.
+#[cfg(feature = "wgpu")]
+fn map_bump_download(download: &wgpu::Buffer) -> Arc<OnceLock<bool>> {
+    let mapped = Arc::new(OnceLock::new());
+    let answer = mapped.clone();
+    download
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |result| {
+            let _ = answer.set(result.is_ok());
+        });
+    mapped
+}
+
+/// The allocation counters in a mapped download, which this unmaps.
+#[cfg(feature = "wgpu")]
+fn read_bump_download(download: &wgpu::Buffer) -> Option<BumpAllocators> {
+    let bump = {
+        let mapped = download.slice(..).get_mapped_range().ok()?;
+        bytemuck::pod_read_unaligned(&mapped[..size_of::<BumpAllocators>()])
+    };
+    download.unmap();
+    Some(bump)
+}
+
 #[cfg(feature = "wgpu")]
 struct RenderResult {
     bump: Option<BumpAllocators>,
@@ -447,6 +499,8 @@ impl Renderer {
             image_atlas: None,
             shaders,
             bump_sizes: vello_encoding::BumpSizes::default(),
+            bump_watch: BumpWatch::default(),
+            bump_readbacks: VecDeque::with_capacity(MAX_BUMP_READBACKS),
             #[cfg(feature = "debug_layers")]
             debug,
             #[cfg(feature = "wgpu-profiler")]
@@ -475,11 +529,24 @@ impl Renderer {
     /// (a large target, many clip layers, a dense scene) is not drawn. So,
     /// except with [`RendererOptions::use_cpu`] and on WebAssembly (where the
     /// device cannot be waited on), each frame's allocation counters are read
-    /// back; when it overflowed, the buffers it ran out of are grown to what it
-    /// asked for and the frame is drawn again, up to four times. The grown
-    /// sizes are kept for every later frame, so a renderer pays the extra draw
-    /// once per new high, not per frame. Reading the counters waits for the
-    /// GPU to finish the frame.
+    /// back, and the buffers it ran out of are grown to what it asked for. The
+    /// grown sizes are kept for every later frame.
+    ///
+    /// Most frames do not wait for those counters: a later call collects them
+    /// without blocking. A frame waits only when it is at risk of setting a new
+    /// high ([`BumpWatch`] has the rule; roughly, a
+    /// target or scene larger than any seen to fit, or usage climbing through
+    /// the last quarter of a buffer, and always the first frame of a renderer).
+    /// Waiting blocks until the GPU has finished everything submitted on the
+    /// device, and lets an overflowing frame be drawn again at once, up to four
+    /// times.
+    ///
+    /// A frame that did not wait and overflowed anyway is shown undrawn, as are
+    /// any others submitted before its counters arrive, and on a transparent
+    /// target that is a blank frame. That is the price of not waiting, and it
+    /// is logged at warn level; the buffers are grown when the counters arrive
+    /// and the next frame waits. A frame that finds the queue of counters on
+    /// their way back full is not read at all.
     pub fn render_to_texture(
         &mut self,
         device: &Device,
@@ -495,6 +562,7 @@ impl Renderer {
                 .max_storage_buffer_binding_size
                 .min(limits.max_buffer_size)
         };
+        self.collect_bump_readbacks(device, max_bytes);
         for attempt in 0..4 {
             let mut render = Render::new();
             render.bump_sizes = Some(self.bump_sizes);
@@ -511,7 +579,7 @@ impl Renderer {
             let gpu_config = render.gpu_config.expect("set by the coarse recording");
             render.record_fine(&self.shaders, &mut recording);
             let external_resources = [ExternalResource::Image(target, texture)];
-            self.engine.run_recording(
+            let submitted = self.engine.run_recording(
                 device,
                 queue,
                 &recording,
@@ -519,7 +587,12 @@ impl Renderer {
                 "render_to_texture",
                 #[cfg(feature = "wgpu-profiler")]
                 &mut self.profiler,
-            )?;
+            );
+            if let Err(e) = submitted {
+                // The download may be in place by the time a recording fails.
+                self.engine.free_download(bump_buf);
+                return Err(e);
+            }
             // N.B. This is horrible; this integration of wgpu-profiler really needs some work...
             #[cfg(feature = "wgpu-profiler")]
             {
@@ -534,6 +607,11 @@ impl Renderer {
             if !robust {
                 break;
             }
+            let at_risk = self.bump_watch.take_risk(&FrameShape::of(&gpu_config));
+            if attempt == 0 && !at_risk {
+                self.queue_bump_readback(bump_buf, gpu_config);
+                break;
+            }
             let bump = self.read_bump(device, bump_buf);
             let Some(bump) = bump else { break };
             log::debug!(
@@ -542,10 +620,12 @@ impl Renderer {
                 params.height,
                 vello_encoding::BumpSizes::of(&gpu_config)
             );
+            let grown = self
+                .bump_watch
+                .observe(&gpu_config, &bump, self.bump_sizes, max_bytes);
             if bump.failed == 0 {
                 break;
             }
-            let grown = vello_encoding::BumpSizes::grown_for(&gpu_config, &bump, max_bytes);
             if grown == vello_encoding::BumpSizes::of(&gpu_config) {
                 log::warn!(
                     "vello: a {}x{} frame needs more than the device's largest buffer ({max_bytes} bytes); it was not drawn ({bump:?})",
@@ -568,43 +648,70 @@ impl Renderer {
     /// The allocation counters a frame's coarse stages left, read back from
     /// `bump_buf` (scheduled for download by a robust recording), waiting for
     /// the GPU. `None` when the download is not there or cannot be mapped.
-    #[cfg(not(target_arch = "wasm32"))]
     fn read_bump(
         &mut self,
         device: &Device,
         buf: recording::BufferProxy,
     ) -> Option<BumpAllocators> {
-        let bump = {
-            let download = self.engine.get_download(buf)?;
-            let slice = download.slice(..);
-            let (sender, receiver) = std::sync::mpsc::channel();
-            slice.map_async(wgpu::MapMode::Read, move |v| {
-                let _ = sender.send(v);
-            });
-            device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
-            match receiver.recv() {
-                Ok(Ok(())) => {
-                    let mapped = slice.get_mapped_range().ok()?;
-                    let bump: BumpAllocators =
-                        bytemuck::pod_read_unaligned(&mapped[..size_of::<BumpAllocators>()]);
-                    drop(mapped);
-                    download.unmap();
-                    Some(bump)
-                }
-                _ => None,
-            }
-        };
-        self.engine.free_download(buf);
-        bump
+        let download = self.engine.take_download(buf)?;
+        let mapped = map_bump_download(&download);
+        device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+        (mapped.get() == Some(&true))
+            .then(|| read_bump_download(&download))
+            .flatten()
     }
 
-    #[cfg(target_arch = "wasm32")]
-    fn read_bump(
-        &mut self,
-        _device: &Device,
-        _bump_buf: recording::BufferProxy,
-    ) -> Option<BumpAllocators> {
-        None
+    /// Leaves a submitted frame's counters to be collected by a later
+    /// [`collect_bump_readbacks`](Self::collect_bump_readbacks), or drops them
+    /// when too many are on their way back already.
+    fn queue_bump_readback(&mut self, buf: recording::BufferProxy, config: ConfigUniform) {
+        let Some(download) = self.engine.take_download(buf) else {
+            return;
+        };
+        if self.bump_readbacks.len() < MAX_BUMP_READBACKS {
+            let mapped = map_bump_download(&download);
+            self.bump_readbacks.push_back(BumpReadback {
+                download,
+                mapped,
+                config,
+            });
+        }
+    }
+
+    /// Takes in the counters of earlier frames that have come back, without
+    /// waiting for the ones that have not, growing the buffers for any frame
+    /// that overflowed.
+    fn collect_bump_readbacks(&mut self, device: &Device, max_bytes: u64) {
+        if self.bump_readbacks.is_empty() {
+            return;
+        }
+        // Whatever this cannot do now, a later poll can.
+        let _ = device.poll(wgpu::PollType::Poll);
+        while let Some(&mapped) = self.bump_readbacks.front().and_then(|r| r.mapped.get()) {
+            let readback = self.bump_readbacks.pop_front().expect("just looked at");
+            let bump = mapped
+                .then(|| read_bump_download(&readback.download))
+                .flatten();
+            let Some(bump) = bump else { continue };
+            let config = &readback.config;
+            log::debug!(
+                "vello: a {}x{} frame used {bump:?} of {:?}",
+                config.target_width,
+                config.target_height,
+                vello_encoding::BumpSizes::of(config)
+            );
+            let grown = self
+                .bump_watch
+                .observe(config, &bump, self.bump_sizes, max_bytes);
+            if bump.failed != 0 {
+                log::warn!(
+                    "vello: a {}x{} frame ran out of buffer space and was shown undrawn ({bump:?}); the buffers are now {grown:?}",
+                    config.target_width,
+                    config.target_height,
+                );
+            }
+            self.bump_sizes = grown;
+        }
     }
 
     /// Overwrite `image` with `texture`.
@@ -666,7 +773,7 @@ impl Renderer {
         // Create a fake, empty blob which will be used to back the returned image
         // This image data will never be read by Vello, due to being added to
         // image_overrides, below.
-        let fake_blob = peniko::Blob::new(std::sync::Arc::new(&[]));
+        let fake_blob = peniko::Blob::new(Arc::new(&[]));
 
         let image = ImageData {
             data: fake_blob,

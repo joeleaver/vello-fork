@@ -247,6 +247,19 @@ pub struct BumpSizes {
     pub ptcl: u32,
 }
 
+/// The largest buffer size at or under `max` that the engine's pool leaves as
+/// it is. The pool rounds every size up to a power of two or one and a half
+/// times one (`SIZE_CLASS_BITS` in `wgpu_engine.rs`), so a buffer sized to a
+/// limit that is neither is created past the limit, and `create_buffer` panics.
+const fn pool_size_class_below(max: u64) -> u64 {
+    if max < 2 {
+        return max;
+    }
+    let power = 1 << (63 - max.leading_zeros());
+    let between = power + power / 2;
+    if max >= between { between } else { power }
+}
+
 /// What the shaders' `PTCL_INITIAL_ALLOC` reserves per tile before the
 /// dynamic part of the command list (`shader/shared/ptcl.wgsl`).
 const PTCL_INITIAL_ALLOC: u32 = 64;
@@ -290,7 +303,7 @@ impl BumpSizes {
             .saturating_mul(g.height_in_tiles)
             .saturating_mul(PTCL_INITIAL_ALLOC);
         // `BufferSize` counts bytes in a `u32`.
-        let max_bytes = max_bytes.min(u32::MAX as u64);
+        let max_bytes = pool_size_class_below(max_bytes.min(u32::MAX as u64));
         let cap = |elem_bytes: usize| (max_bytes / elem_bytes as u64) as u32;
         let grow = |have: u32, wanted: u32, failed: bool, elem_bytes: usize| -> u32 {
             let target = if wanted > have {
@@ -357,6 +370,53 @@ impl BumpSizes {
                 size_of::<u32>(),
             ),
         }
+    }
+
+    /// What a frame recorded with config `g` used of each buffer, in the same
+    /// terms as the sizes (the counters leave out the static part of the ptcl).
+    pub fn used(g: &ConfigUniform, bump: &BumpAllocators) -> Self {
+        let ptcl_static = g
+            .width_in_tiles
+            .saturating_mul(g.height_in_tiles)
+            .saturating_mul(PTCL_INITIAL_ALLOC);
+        Self {
+            lines: bump.lines,
+            binning: bump.binning,
+            tiles: bump.tile,
+            seg_counts: bump.seg_counts,
+            segments: bump.segments,
+            blend: bump.blend,
+            ptcl: ptcl_static.saturating_add(bump.ptcl),
+        }
+    }
+
+    /// Every field the larger of the two.
+    #[must_use]
+    pub fn at_least(self, other: Self) -> Self {
+        Self {
+            lines: self.lines.max(other.lines),
+            binning: self.binning.max(other.binning),
+            tiles: self.tiles.max(other.tiles),
+            seg_counts: self.seg_counts.max(other.seg_counts),
+            segments: self.segments.max(other.segments),
+            blend: self.blend.max(other.blend),
+            ptcl: self.ptcl.max(other.ptcl),
+        }
+    }
+
+    /// Whether these usages take any buffer of `sizes` past 3/4 of it and past
+    /// its entry in `high`, the most seen of it before.
+    pub(crate) fn nears_limit(&self, sizes: &Self, high: &Self) -> bool {
+        let near = |used: u32, size: u32, high: u32| {
+            used > high && u64::from(used) * 4 > u64::from(size) * 3
+        };
+        near(self.lines, sizes.lines, high.lines)
+            || near(self.binning, sizes.binning, high.binning)
+            || near(self.tiles, sizes.tiles, high.tiles)
+            || near(self.seg_counts, sizes.seg_counts, high.seg_counts)
+            || near(self.segments, sizes.segments, high.segments)
+            || near(self.blend, sizes.blend, high.blend)
+            || near(self.ptcl, sizes.ptcl, high.ptcl)
     }
 }
 
@@ -634,6 +694,23 @@ mod bump_sizes_tests {
         assert_eq!(rc.gpu.tiles_size, grown.tiles);
         assert_eq!(rc.buffer_sizes.tiles.len(), grown.tiles);
         assert_eq!(BumpSizes::of(&rc.gpu), grown);
+    }
+
+    #[test]
+    fn a_grown_buffer_stays_under_the_limit_once_the_pool_rounds_it_up() {
+        assert_eq!(pool_size_class_below(128 << 20), 128 << 20);
+        assert_eq!(pool_size_class_below(256 << 20), 256 << 20);
+        assert_eq!(pool_size_class_below((1 << 31) - 1), 3 << 29);
+        assert_eq!(pool_size_class_below((3 << 29) - 1), 1 << 30);
+
+        let g = config(3840, 2160);
+        let bump = BumpAllocators {
+            failed: STAGE_TILE_ALLOC,
+            tile: u32::MAX / 16,
+            ..Default::default()
+        };
+        let tiles = BumpSizes::grown_for(&g, &bump, (1 << 31) - 1).tiles as u64;
+        assert_eq!(tiles * size_of::<Tile>() as u64, 3 << 29);
     }
 
     #[test]

@@ -780,6 +780,12 @@ impl WgpuEngine {
         self.downloads.get(&buf.id)
     }
 
+    /// Takes the download out of the engine, for a caller that keeps it past
+    /// the end of this recording. Dropping it frees it.
+    pub fn take_download(&mut self, buf: BufferProxy) -> Option<Buffer> {
+        self.downloads.remove(&buf.id)
+    }
+
     pub fn free_download(&mut self, buf: BufferProxy) {
         self.downloads.remove(&buf.id);
     }
