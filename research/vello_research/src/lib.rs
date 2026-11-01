@@ -322,18 +322,14 @@ pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 /// This is an assumption which is known to be limiting, and is planned to change.
 #[cfg(feature = "wgpu")]
 pub struct Renderer {
-    #[cfg_attr(
-        not(feature = "hot_reload"),
-        expect(
-            dead_code,
-            reason = "Options are only used to reinitialise on a hot reload"
-        )
-    )]
     options: RendererOptions,
     engine: WgpuEngine,
     resolver: Resolver,
     image_atlas: Option<recording::ImageProxy>,
     shaders: FullShaders,
+    /// The least the bump-allocated buffers get, grown whenever a frame ran
+    /// out of one (see [`Renderer::render_to_texture`]); it never shrinks.
+    bump_sizes: vello_encoding::BumpSizes,
     #[cfg(feature = "debug_layers")]
     debug: debug::DebugRenderer,
     #[cfg(feature = "wgpu-profiler")]
@@ -450,6 +446,7 @@ impl Renderer {
             resolver: Resolver::new(),
             image_atlas: None,
             shaders,
+            bump_sizes: vello_encoding::BumpSizes::default(),
             #[cfg(feature = "debug_layers")]
             debug,
             #[cfg(feature = "wgpu-profiler")]
@@ -473,6 +470,16 @@ impl Renderer {
     /// 2) Call `render_to_texture` directly on the [`SurfaceTexture`][wgpu::SurfaceTexture]'s texture, if
     ///    it has the right usages. This should generally be avoided, as some GPUs assume that you will not
     ///    be rendering to the surface using a compute pipeline, and optimise accordingly.
+    ///
+    /// A frame whose GPU stages run out of one of their bump-allocated buffers
+    /// (a large target, many clip layers, a dense scene) is not drawn. So,
+    /// except with [`RendererOptions::use_cpu`] and on WebAssembly (where the
+    /// device cannot be waited on), each frame's allocation counters are read
+    /// back; when it overflowed, the buffers it ran out of are grown to what it
+    /// asked for and the frame is drawn again, up to four times. The grown
+    /// sizes are kept for every later frame, so a renderer pays the extra draw
+    /// once per new high, not per frame. Reading the counters waits for the
+    /// GPU to finish the frame.
     pub fn render_to_texture(
         &mut self,
         device: &Device,
@@ -481,39 +488,123 @@ impl Renderer {
         texture: &TextureView,
         params: &RenderParams,
     ) -> Result<()> {
-        let (recording, target) = render::render_full(
-            scene,
-            &mut self.resolver,
-            &self.shaders,
-            &mut self.image_atlas,
-            params,
-        );
-        let external_resources = [ExternalResource::Image(
-            *target.as_image().unwrap(),
-            texture,
-        )];
-        self.engine.run_recording(
-            device,
-            queue,
-            &recording,
-            &external_resources,
-            "render_to_texture",
+        let robust = !self.options.use_cpu && !cfg!(target_arch = "wasm32");
+        let max_bytes = {
+            let limits = device.limits();
+            limits
+                .max_storage_buffer_binding_size
+                .min(limits.max_buffer_size)
+        };
+        for attempt in 0..4 {
+            let mut render = Render::new();
+            render.bump_sizes = Some(self.bump_sizes);
+            let mut recording = render.render_encoding_coarse(
+                scene.encoding(),
+                &mut self.resolver,
+                &self.shaders,
+                &mut self.image_atlas,
+                params,
+                robust,
+            );
+            let target = render.out_image();
+            let bump_buf = render.bump_buf();
+            let gpu_config = render.gpu_config.expect("set by the coarse recording");
+            render.record_fine(&self.shaders, &mut recording);
+            let external_resources = [ExternalResource::Image(target, texture)];
+            self.engine.run_recording(
+                device,
+                queue,
+                &recording,
+                &external_resources,
+                "render_to_texture",
+                #[cfg(feature = "wgpu-profiler")]
+                &mut self.profiler,
+            )?;
+            // N.B. This is horrible; this integration of wgpu-profiler really needs some work...
             #[cfg(feature = "wgpu-profiler")]
-            &mut self.profiler,
-        )?;
-        // N.B. This is horrible; this integration of wgpu-profiler really needs some work...
-        #[cfg(feature = "wgpu-profiler")]
-        {
-            self.profiler.end_frame().unwrap();
-            if let Some(result) = self
-                .profiler
-                .process_finished_frame(queue.get_timestamp_period())
             {
-                self.profile_result = Some(result);
+                self.profiler.end_frame().unwrap();
+                if let Some(result) = self
+                    .profiler
+                    .process_finished_frame(queue.get_timestamp_period())
+                {
+                    self.profile_result = Some(result);
+                }
             }
+            if !robust {
+                break;
+            }
+            let bump = self.read_bump(device, bump_buf);
+            let Some(bump) = bump else { break };
+            log::debug!(
+                "vello: a {}x{} frame used {bump:?} of {:?}",
+                params.width,
+                params.height,
+                vello_encoding::BumpSizes::of(&gpu_config)
+            );
+            if bump.failed == 0 {
+                break;
+            }
+            let grown = vello_encoding::BumpSizes::grown_for(&gpu_config, &bump, max_bytes);
+            if grown == vello_encoding::BumpSizes::of(&gpu_config) {
+                log::warn!(
+                    "vello: a {}x{} frame needs more than the device's largest buffer ({max_bytes} bytes); it was not drawn ({bump:?})",
+                    params.width,
+                    params.height
+                );
+                break;
+            }
+            log::info!(
+                "vello: a {}x{} frame ran out of buffer space (try {}, {bump:?}); drawing it again with {grown:?}",
+                params.width,
+                params.height,
+                attempt + 1
+            );
+            self.bump_sizes = grown;
         }
-
         Ok(())
+    }
+
+    /// The allocation counters a frame's coarse stages left, read back from
+    /// `bump_buf` (scheduled for download by a robust recording), waiting for
+    /// the GPU. `None` when the download is not there or cannot be mapped.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_bump(
+        &mut self,
+        device: &Device,
+        buf: recording::BufferProxy,
+    ) -> Option<BumpAllocators> {
+        let bump = {
+            let download = self.engine.get_download(buf)?;
+            let slice = download.slice(..);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |v| {
+                let _ = sender.send(v);
+            });
+            device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+            match receiver.recv() {
+                Ok(Ok(())) => {
+                    let mapped = slice.get_mapped_range().ok()?;
+                    let bump: BumpAllocators =
+                        bytemuck::pod_read_unaligned(&mapped[..size_of::<BumpAllocators>()]);
+                    drop(mapped);
+                    download.unmap();
+                    Some(bump)
+                }
+                _ => None,
+            }
+        };
+        self.engine.free_download(buf);
+        bump
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn read_bump(
+        &mut self,
+        _device: &Device,
+        _bump_buf: recording::BufferProxy,
+    ) -> Option<BumpAllocators> {
+        None
     }
 
     /// Overwrite `image` with `texture`.
