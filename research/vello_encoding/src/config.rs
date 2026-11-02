@@ -201,9 +201,10 @@ impl RenderConfig {
     ///
     /// Vello's own sizes for these buffers are fixed guesses that do not grow
     /// with the target or the scene; a large window with many layers needs
-    /// more, and a frame that runs out is dropped. A renderer that reads back
-    /// [`BumpAllocators`] after a frame learns what it needed
-    /// ([`BumpSizes::grown_for`]) and passes it here for the next try.
+    /// more, and a frame that runs out is dropped. A renderer passes here the
+    /// floors its target needs ([`BumpSizes::floors`]) and, once it has read
+    /// back the [`BumpAllocators`] of a frame that overflowed, what that frame
+    /// needed ([`BumpSizes::grown_for`]).
     #[must_use]
     pub fn with_bump_sizes(mut self, min: &BumpSizes) -> Self {
         let sizes = &mut self.buffer_sizes;
@@ -247,6 +248,36 @@ pub struct BumpSizes {
     pub ptcl: u32,
 }
 
+/// The largest buffer size at or under `max` that the engine's pool leaves as
+/// it is. The pool rounds every size up to a power of two or one and a half
+/// times one (`SIZE_CLASS_BITS` in `wgpu_engine.rs`), so a buffer sized to a
+/// limit that is neither is created past the limit, and `create_buffer` panics.
+const fn pool_size_class_below(max: u64) -> u64 {
+    if max < 2 {
+        return max;
+    }
+    let power = 1 << (63 - max.leading_zeros());
+    let between = power + power / 2;
+    if max >= between { between } else { power }
+}
+
+/// The floor of the tile buffer, in tiles per tile of the target.
+///
+/// Vello's fixed 2^21 tiles give a 4K target 64 per target tile and an 8K one
+/// 16. A 4K frame of a busy app used 9 per target tile and a 1080p one 14
+/// (Pimble's shape, after rinch stopped pushing clips that cut nothing), so 32
+/// is twice the worst of those. It changes nothing up to 5K.
+const TILES_PER_TARGET_TILE: u32 = 32;
+
+/// The floor of the per-tile command list, in words per tile of the target,
+/// the 64 the shaders reserve included.
+///
+/// Vello's fixed 2^23 words give a 4K target 259 per target tile and an 8K one
+/// 65, which leaves an 8K frame almost nothing past the reserved 64. The same
+/// frames used 65 at 4K and 72 at 1080p, and this floor keeps the room a 4K
+/// frame has at every larger size. It changes nothing up to 4K.
+const PTCL_WORDS_PER_TARGET_TILE: u32 = 256;
+
 /// What the shaders' `PTCL_INITIAL_ALLOC` reserves per tile before the
 /// dynamic part of the command list (`shader/shared/ptcl.wgsl`).
 const PTCL_INITIAL_ALLOC: u32 = 64;
@@ -272,6 +303,44 @@ impl BumpSizes {
         }
     }
 
+    /// The least a frame of a `width`x`height` target should have, whatever
+    /// any frame has needed so far: what a tile buffer and a command list need
+    /// grows with the target, and Vello's fixed sizes do not. Only those two
+    /// buffers have floors; every other field is 0, which leaves Vello's size.
+    ///
+    /// Neither floor passes `max_bytes`, the device's largest storage binding,
+    /// nor does the engine's pool take it past that by rounding it up.
+    pub fn floors(width: u32, height: u32, max_bytes: u64) -> Self {
+        let target_tiles = width
+            .div_ceil(TILE_WIDTH)
+            .saturating_mul(height.div_ceil(TILE_HEIGHT));
+        let max_bytes = pool_size_class_below(max_bytes.min(u32::MAX as u64));
+        let floor = |per_target_tile: u32, elem_bytes: usize| {
+            target_tiles
+                .saturating_mul(per_target_tile)
+                .min((max_bytes / elem_bytes as u64) as u32)
+        };
+        Self {
+            tiles: floor(TILES_PER_TARGET_TILE, size_of::<Tile>()),
+            ptcl: floor(PTCL_WORDS_PER_TARGET_TILE, size_of::<u32>()),
+            ..Self::default()
+        }
+    }
+
+    /// Every field the larger of the two.
+    #[must_use]
+    pub fn at_least(self, other: Self) -> Self {
+        Self {
+            lines: self.lines.max(other.lines),
+            binning: self.binning.max(other.binning),
+            tiles: self.tiles.max(other.tiles),
+            seg_counts: self.seg_counts.max(other.seg_counts),
+            segments: self.segments.max(other.segments),
+            blend: self.blend.max(other.blend),
+            ptcl: self.ptcl.max(other.ptcl),
+        }
+    }
+
     /// Sizes for another try at a frame recorded with config `g` whose
     /// counters came back as `bump`: every buffer the frame overflowed made
     /// large enough for what it asked of it, with a quarter more to spare.
@@ -290,7 +359,7 @@ impl BumpSizes {
             .saturating_mul(g.height_in_tiles)
             .saturating_mul(PTCL_INITIAL_ALLOC);
         // `BufferSize` counts bytes in a `u32`.
-        let max_bytes = max_bytes.min(u32::MAX as u64);
+        let max_bytes = pool_size_class_below(max_bytes.min(u32::MAX as u64));
         let cap = |elem_bytes: usize| (max_bytes / elem_bytes as u64) as u32;
         let grow = |have: u32, wanted: u32, failed: bool, elem_bytes: usize| -> u32 {
             let target = if wanted > have {
@@ -634,6 +703,68 @@ mod bump_sizes_tests {
         assert_eq!(rc.gpu.tiles_size, grown.tiles);
         assert_eq!(rc.buffer_sizes.tiles.len(), grown.tiles);
         assert_eq!(BumpSizes::of(&rc.gpu), grown);
+    }
+
+    #[test]
+    fn floors_leave_vello_s_sizes_up_to_4k() {
+        for (w, h) in [(800, 600), (1920, 1080), (2560, 1440), (3840, 2160)] {
+            let plain = RenderConfig::new(&Layout::default(), w, h, &peniko::Color::WHITE);
+            let had = BumpSizes::of(&plain.gpu);
+            let floored = plain.with_bump_sizes(&BumpSizes::floors(w, h, 128 << 20));
+            assert_eq!(BumpSizes::of(&floored.gpu), had, "{w}x{h}");
+        }
+    }
+
+    #[test]
+    fn floors_follow_the_target_past_vello_s_sizes() {
+        // 8K is 480x270 tiles.
+        let floors = BumpSizes::floors(7680, 4320, u64::MAX);
+        assert_eq!(floors.tiles, 480 * 270 * 32);
+        assert_eq!(floors.ptcl, 480 * 270 * 256);
+        let rc = RenderConfig::new(&Layout::default(), 7680, 4320, &peniko::Color::WHITE);
+        let had = BumpSizes::of(&rc.gpu);
+        let rc = rc.with_bump_sizes(&floors);
+        assert_eq!(rc.gpu.tiles_size, floors.tiles);
+        assert_eq!(rc.buffer_sizes.ptcl.len(), floors.ptcl);
+        // The floors are of these two buffers alone.
+        assert_eq!(rc.gpu.lines_size, had.lines);
+        assert_eq!(rc.gpu.segments_size, had.segments);
+        assert_eq!(rc.gpu.blend_size, had.blend);
+        // A partly covered tile on the edge of the target counts as a tile.
+        assert_eq!(BumpSizes::floors(161, 17, u64::MAX).tiles, 11 * 2 * 32);
+    }
+
+    #[test]
+    fn floors_stay_under_the_limit_once_the_pool_rounds_them_up() {
+        // wgpu's default limit is a size class: taken as it is.
+        let ptcl = BumpSizes::floors(16384, 16384, 128 << 20).ptcl as u64;
+        assert_eq!(ptcl * 4, 128 << 20);
+        // Between classes, the floor falls to the class under it.
+        let floors = BumpSizes::floors(16384, 16384, (128 << 20) + 1);
+        assert_eq!(floors.ptcl as u64 * 4, 128 << 20);
+        let floors = BumpSizes::floors(65536, 65536, (1 << 31) - 1);
+        assert_eq!(floors.ptcl as u64 * 4, 3 << 29);
+        assert_eq!(floors.tiles as u64 * size_of::<Tile>() as u64, 3 << 29);
+        // A target too wide for the arithmetic saturates to the same cap.
+        let floors = BumpSizes::floors(u32::MAX, u32::MAX, 128 << 20);
+        assert_eq!(floors.ptcl as u64 * 4, 128 << 20);
+    }
+
+    #[test]
+    fn a_grown_buffer_stays_under_the_limit_once_the_pool_rounds_it_up() {
+        assert_eq!(pool_size_class_below(128 << 20), 128 << 20);
+        assert_eq!(pool_size_class_below(256 << 20), 256 << 20);
+        assert_eq!(pool_size_class_below((1 << 31) - 1), 3 << 29);
+        assert_eq!(pool_size_class_below((3 << 29) - 1), 1 << 30);
+
+        let g = config(3840, 2160);
+        let bump = BumpAllocators {
+            failed: STAGE_TILE_ALLOC,
+            tile: u32::MAX / 16,
+            ..Default::default()
+        };
+        let tiles = BumpSizes::grown_for(&g, &bump, (1 << 31) - 1).tiles as u64;
+        assert_eq!(tiles * size_of::<Tile>() as u64, 3 << 29);
     }
 
     #[test]
