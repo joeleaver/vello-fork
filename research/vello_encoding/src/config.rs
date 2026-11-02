@@ -272,11 +272,12 @@ const TILES_PER_TARGET_TILE: u32 = 32;
 /// The floor of the per-tile command list, in words per tile of the target,
 /// the 64 the shaders reserve included.
 ///
-/// Vello's fixed 2^23 words give a 4K target 259 per target tile and an 8K one
-/// 65, which leaves an 8K frame almost nothing past the reserved 64. The same
-/// frames used 65 at 4K and 72 at 1080p, and this floor keeps the room a 4K
-/// frame has at every larger size. It changes nothing up to 4K.
-const PTCL_WORDS_PER_TARGET_TILE: u32 = 256;
+/// Vello's fixed 2^23 words give a 1080p target 1035 per target tile, a 4K one
+/// 259 and an 8K one 65, which leaves an 8K frame almost nothing past the
+/// reserved 64. Text and boxes use 65 to 72 at 1080p and 4K, but 8 sequential
+/// full-window opacity layers, a plausible page, overflow 256 at 4K, and a new
+/// renderer would pay that again each time. It changes nothing up to 1440p.
+const PTCL_WORDS_PER_TARGET_TILE: u32 = 512;
 
 /// What the shaders' `PTCL_INITIAL_ALLOC` reserves per tile before the
 /// dynamic part of the command list (`shader/shared/ptcl.wgsl`).
@@ -706,8 +707,8 @@ mod bump_sizes_tests {
     }
 
     #[test]
-    fn floors_leave_vello_s_sizes_up_to_4k() {
-        for (w, h) in [(800, 600), (1920, 1080), (2560, 1440), (3840, 2160)] {
+    fn floors_leave_vello_s_sizes_up_to_1440p() {
+        for (w, h) in [(800, 600), (1920, 1080), (2560, 1440)] {
             let plain = RenderConfig::new(&Layout::default(), w, h, &peniko::Color::WHITE);
             let had = BumpSizes::of(&plain.gpu);
             let floored = plain.with_bump_sizes(&BumpSizes::floors(w, h, 128 << 20));
@@ -717,10 +718,18 @@ mod bump_sizes_tests {
 
     #[test]
     fn floors_follow_the_target_past_vello_s_sizes() {
+        // 4K is 240x135 tiles: the tiles keep Vello's size, the words pass it.
+        let floors = BumpSizes::floors(3840, 2160, 128 << 20);
+        assert_eq!(floors.ptcl, 240 * 135 * 512);
+        let rc = RenderConfig::new(&Layout::default(), 3840, 2160, &peniko::Color::WHITE);
+        let had = BumpSizes::of(&rc.gpu);
+        let rc = rc.with_bump_sizes(&floors);
+        assert_eq!(rc.gpu.ptcl_size, floors.ptcl);
+        assert_eq!(rc.gpu.tiles_size, had.tiles);
         // 8K is 480x270 tiles.
         let floors = BumpSizes::floors(7680, 4320, u64::MAX);
         assert_eq!(floors.tiles, 480 * 270 * 32);
-        assert_eq!(floors.ptcl, 480 * 270 * 256);
+        assert_eq!(floors.ptcl, 480 * 270 * 512);
         let rc = RenderConfig::new(&Layout::default(), 7680, 4320, &peniko::Color::WHITE);
         let had = BumpSizes::of(&rc.gpu);
         let rc = rc.with_bump_sizes(&floors);
@@ -730,6 +739,11 @@ mod bump_sizes_tests {
         assert_eq!(rc.gpu.lines_size, had.lines);
         assert_eq!(rc.gpu.segments_size, had.segments);
         assert_eq!(rc.gpu.blend_size, had.blend);
+        // At wgpu's default limit the 8K words stop at 128 MiB.
+        assert_eq!(
+            BumpSizes::floors(7680, 4320, 128 << 20).ptcl as u64 * 4,
+            128 << 20
+        );
         // A partly covered tile on the edge of the target counts as a tile.
         assert_eq!(BumpSizes::floors(161, 17, u64::MAX).tiles, 11 * 2 * 32);
     }
