@@ -336,8 +336,10 @@ pub struct Renderer {
     /// [`Renderer::render_to_texture`]). It never shrinks.
     bump_sizes: vello_encoding::BumpSizes,
     /// The counters of frames submitted and not yet read, oldest first, at
-    /// most [`MAX_BUMP_READBACKS`] of them.
+    /// most `bump_readback_limit` of them.
     bump_readbacks: VecDeque<BumpReadback>,
+    /// [`MAX_BUMP_READBACKS`], unless a test says otherwise.
+    bump_readback_limit: usize,
     /// A frame was found to have overflowed, and [`Renderer::check_frames`]
     /// has not said so yet.
     frame_lost: bool,
@@ -438,16 +440,18 @@ pub enum FrameCheck {
     /// Some frames' counters are still on their way back: check again later.
     Pending,
     /// A frame overflowed and was left undrawn, and its buffers have been
-    /// grown. Whatever it drew is wrong until it is drawn again. A check after
-    /// this one says how the frames still in flight fared.
+    /// grown, or its counters could not be had and it may have. Whatever it
+    /// drew is wrong until it is drawn again. A check after this one says how
+    /// the frames still in flight fared.
     Lost,
 }
 
-/// How many frames' counters can be on their way back at once. A frame finding
-/// this many pushes out the oldest: the newest frame is the one showing. A
-/// split frame counts each of its slices.
+/// How many frames' counters can be on their way back at once. A split frame
+/// counts each of its slices. A frame finding this many pushes out the oldest,
+/// whose counters are then never seen, so that frame counts as lost: a later
+/// frame does not redraw what it drew when that was a kept slice.
 #[cfg(feature = "wgpu")]
-const MAX_BUMP_READBACKS: usize = 32;
+const MAX_BUMP_READBACKS: usize = 64;
 
 /// A frame's allocation counters on their way back from the GPU. Dropping this
 /// frees the download.
@@ -511,6 +515,7 @@ impl Renderer {
             shaders,
             bump_sizes: vello_encoding::BumpSizes::default(),
             bump_readbacks: VecDeque::with_capacity(MAX_BUMP_READBACKS),
+            bump_readback_limit: MAX_BUMP_READBACKS,
             frame_lost: false,
             #[cfg(feature = "debug_layers")]
             debug,
@@ -623,6 +628,12 @@ impl Renderer {
     /// [`Lost`](FrameCheck::Lost) means drawing the frame again can help: a
     /// frame that needs more than the device's largest buffer is logged and
     /// not reported, since it would fail again every time.
+    ///
+    /// This does not report a lost device: it polls the device, and on a lost
+    /// device `Device::poll` panics rather than returning an error (wgpu holds
+    /// it fatal; seen on Vulkan). A host that means to survive a device loss
+    /// cannot do so past a call to this or to [`Self::render_to_texture`]
+    /// while readbacks are out.
     pub fn check_frames(&mut self, device: &Device) -> FrameCheck {
         self.collect_bump_readbacks(device, max_bump_bytes(device));
         if std::mem::take(&mut self.frame_lost) {
@@ -634,14 +645,23 @@ impl Renderer {
         }
     }
 
+    /// Limits the frames whose counters can be on their way back, so that a
+    /// test can have one pushed out without outrunning the GPU 64 times.
+    #[doc(hidden)]
+    pub fn set_bump_readback_limit(&mut self, limit: usize) {
+        self.bump_readback_limit = limit.max(1);
+    }
+
     /// Starts reading back the counters of a frame that has been submitted.
     /// The answer arrives when the device is next polled.
     fn queue_bump_readback(&mut self, buf: recording::BufferProxy, config: ConfigUniform) {
         let Some(download) = self.engine.take_download(buf) else {
             return;
         };
-        if self.bump_readbacks.len() == MAX_BUMP_READBACKS {
+        while self.bump_readbacks.len() >= self.bump_readback_limit {
             self.bump_readbacks.pop_front();
+            log::debug!("vello: a frame's counters were pushed out unread");
+            self.frame_lost = true;
         }
         let mapped = Arc::new(OnceLock::new());
         let answer = mapped.clone();
@@ -663,14 +683,20 @@ impl Renderer {
         if self.bump_readbacks.is_empty() {
             return;
         }
-        // Whatever this cannot do now, a later poll can.
+        // An error here is a poll that can be made again. On a lost device
+        // there is no error: `Device::poll` panics, wgpu holding that fatal.
         let _ = device.poll(wgpu::PollType::Poll);
         while let Some(&mapped) = self.bump_readbacks.front().and_then(|r| r.mapped.get()) {
             let readback = self.bump_readbacks.pop_front().expect("just looked at");
             let bump = mapped
                 .then(|| read_bump_download(&readback.download))
                 .flatten();
-            let Some(bump) = bump else { continue };
+            let Some(bump) = bump else {
+                // Nothing says this frame fitted.
+                log::warn!("vello: a frame's counters could not be read");
+                self.frame_lost = true;
+                continue;
+            };
             let config = &readback.config;
             let (width, height) = (config.target_width, config.target_height);
             let had = vello_encoding::BumpSizes::of(config);
