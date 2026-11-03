@@ -31,6 +31,21 @@ const IMAGE_QUALITY_HIGH = 2u;
 
 const LUMINANCE_MASK_LAYER = 0x10000u;
 
+// A clip's backdrop is kept at 16 bits per channel (two words a pixel), not
+// 8: rounding it to 8 bits rounds whatever is beneath the clip once more
+// before the clip's content is composited over it. That rounding is of the
+// premultiplied backdrop, so a translucent backdrop (a scene rendered over
+// transparent, then composited over something else) loses its alpha to it as
+// well as its colour, and the result differs by more than one 8-bit rounding
+// from the same content rendered over an opaque backdrop.
+fn pack_backdrop(c: vec4<f32>) -> vec2<u32> {
+    return vec2(pack2x16unorm(c.xy), pack2x16unorm(c.zw));
+}
+
+fn unpack_backdrop(p: vec2<u32>) -> vec4<f32> {
+    return vec4(unpack2x16unorm(p.x), unpack2x16unorm(p.y));
+}
+
 @group(0) @binding(2)
 var<storage> ptcl: array<u32>;
 
@@ -1080,7 +1095,7 @@ fn main(
     for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
         rgba[i] = base_color;
     }
-    var blend_stack: array<array<u32, PIXELS_PER_THREAD>, BLEND_STACK_SPLIT>;
+    var blend_stack: array<array<vec2<u32>, PIXELS_PER_THREAD>, BLEND_STACK_SPLIT>;
     var clip_depth = 0u;
     var area: array<f32, PIXELS_PER_THREAD>;
     var cmd_ix = tile_ix * PTCL_INITIAL_ALLOC;
@@ -1120,15 +1135,17 @@ fn main(
             case CMD_BEGIN_CLIP: {
                 if clip_depth < BLEND_STACK_SPLIT {
                     for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
-                        blend_stack[clip_depth][i] = pack4x8unorm(rgba[i]);
+                        blend_stack[clip_depth][i] = pack_backdrop(rgba[i]);
                         rgba[i] = vec4(0.0);
                     }
                 } else {
                     let blend_in_scratch = clip_depth - BLEND_STACK_SPLIT;
                     let local_tile_ix = local_id.x * PIXELS_PER_THREAD + local_id.y * TILE_WIDTH;
-                    let local_blend_start = blend_offset + blend_in_scratch * TILE_WIDTH * TILE_HEIGHT + local_tile_ix;
+                    let local_blend_start = blend_offset + 2u * (blend_in_scratch * TILE_WIDTH * TILE_HEIGHT + local_tile_ix);
                     for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
-                        blend_spill[local_blend_start + i] = pack4x8unorm(rgba[i]);
+                        let packed = pack_backdrop(rgba[i]);
+                        blend_spill[local_blend_start + 2u * i] = packed.x;
+                        blend_spill[local_blend_start + 2u * i + 1u] = packed.y;
                         rgba[i] = vec4(0.0);
                     }
                 }
@@ -1139,16 +1156,16 @@ fn main(
                 let end_clip = read_end_clip(cmd_ix);
                 clip_depth -= 1u;
                 for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
-                    var bg_rgba: u32;
+                    var bg_rgba: vec2<u32>;
                     if clip_depth < BLEND_STACK_SPLIT {
                         bg_rgba = blend_stack[clip_depth][i];
                     } else {
                         let blend_in_scratch = clip_depth - BLEND_STACK_SPLIT;
                         let local_tile_ix = local_id.x * PIXELS_PER_THREAD + local_id.y * TILE_WIDTH;
-                        let local_blend_start = blend_offset + blend_in_scratch * TILE_WIDTH * TILE_HEIGHT + local_tile_ix;
-                        bg_rgba = blend_spill[local_blend_start + i];
+                        let local_blend_start = blend_offset + 2u * (blend_in_scratch * TILE_WIDTH * TILE_HEIGHT + local_tile_ix);
+                        bg_rgba = vec2(blend_spill[local_blend_start + 2u * i], blend_spill[local_blend_start + 2u * i + 1u]);
                     }
-                    let bg = unpack4x8unorm(bg_rgba);
+                    let bg = unpack_backdrop(bg_rgba);
                     let fg = rgba[i] * area[i] * end_clip.alpha;
                     if end_clip.blend == LUMINANCE_MASK_LAYER {
                         // TODO: Does this case apply more generally?
