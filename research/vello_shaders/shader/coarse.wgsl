@@ -460,7 +460,8 @@ fn main(
         ptcl[cmd_offset] = CMD_END;
         var blend_ix = 0u;
         if max_blend_depth > BLEND_STACK_SPLIT {
-            let scratch_size = (max_blend_depth - BLEND_STACK_SPLIT) * TILE_WIDTH * TILE_HEIGHT;
+            // Two words a pixel: fine keeps a clip's backdrop at 16 bits a channel.
+            let scratch_size = 2u * (max_blend_depth - BLEND_STACK_SPLIT) * TILE_WIDTH * TILE_HEIGHT;
             blend_ix = atomicAdd(&bump.blend, scratch_size);
             if blend_ix + scratch_size > config.blend_size {
                 atomicOr(&bump.failed, STAGE_COARSE);
