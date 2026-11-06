@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use crate::DrawBeginClip;
+use crate::draw::{IMAGE_MASK_ALPHA, IMAGE_MASK_NONE, IMAGE_MASK_SHIFT};
 
 use super::{
     DrawBlurRoundedRect, DrawColor, DrawImage, DrawLinearGradient, DrawRadialGradient,
@@ -427,7 +428,30 @@ impl Encoding {
 
     /// Encodes an image brush.
     pub fn encode_image<'b>(&mut self, brush: impl Into<ImageBrushRef<'b>>, alpha: f32) {
-        let brush: ImageBrushRef<'b> = brush.into();
+        self.encode_image_with_mask(brush.into(), alpha, IMAGE_MASK_NONE, 0);
+    }
+
+    /// Encodes an alpha-mask image brush (a fork addition, rinch #2286): the
+    /// image's alpha channel is coverage, and the brush paints `tint` in it.
+    /// The image's colour channels are not read. Sampling, extend modes and
+    /// the image's own `alpha` apply as for [`Self::encode_image`].
+    pub fn encode_image_mask<'b>(
+        &mut self,
+        brush: impl Into<ImageBrushRef<'b>>,
+        alpha: f32,
+        tint: impl Into<DrawColor>,
+    ) {
+        let tint: DrawColor = tint.into();
+        self.encode_image_with_mask(brush.into(), alpha, IMAGE_MASK_ALPHA, tint.rgba);
+    }
+
+    fn encode_image_with_mask(
+        &mut self,
+        brush: ImageBrushRef<'_>,
+        alpha: f32,
+        mask: u32,
+        tint: u32,
+    ) {
         let ImageSampler {
             x_extend,
             y_extend,
@@ -447,12 +471,14 @@ impl Encoding {
             .extend_from_slice(bytemuck::cast_slice(bytemuck::bytes_of(&DrawImage {
                 xy: 0,
                 width_height: (brush.image.width << 16) | (brush.image.height & 0xFFFF),
-                sample_alpha: ((brush.image.format as u32) << 15
+                sample_alpha: (mask << IMAGE_MASK_SHIFT)
+                    | (brush.image.format as u32) << 15
                     | (brush.image.alpha_type as u32) << 14
                     | (quality as u32) << 12
                     | ((x_extend as u32) << 10)
                     | ((y_extend as u32) << 8)
-                    | alpha as u32),
+                    | alpha as u32,
+                tint,
             })));
     }
 
@@ -614,6 +640,40 @@ impl StreamOffsets {
 #[cfg(test)]
 mod tests {
     use peniko::{Extend, ImageQuality};
+
+    /// The fork's image draw (rinch #2286): four words of draw data, the
+    /// mask mode in bits 16-17 of the third, the premultiplied tint in the
+    /// fourth; and the tag's sizes say so.
+    #[test]
+    fn image_mask_draw_data() {
+        use super::{DrawTag, Encoding, IMAGE_MASK_ALPHA, IMAGE_MASK_SHIFT};
+        use peniko::{Blob, ImageAlphaType, ImageBrush, ImageData, ImageFormat, color::AlphaColor};
+        use std::sync::Arc;
+        assert_eq!(DrawTag::IMAGE.info_size(), 11);
+        assert_eq!((DrawTag::IMAGE.0 >> 2) & 7, 4, "scene words");
+        let image = ImageData {
+            data: Blob::new(Arc::new(vec![0_u8; 2 * 3 * 4])),
+            format: ImageFormat::Rgba8,
+            alpha_type: ImageAlphaType::AlphaPremultiplied,
+            width: 2,
+            height: 3,
+        };
+        let mut enc = Encoding::new();
+        enc.encode_image(&ImageBrush::new(image.clone()), 1.0);
+        enc.encode_image_mask(
+            &ImageBrush::new(image),
+            1.0,
+            AlphaColor::<peniko::color::Srgb>::from_rgba8(255, 0, 0, 128),
+        );
+        let words: &[u32] = bytemuck::cast_slice(&enc.draw_data);
+        assert_eq!(words.len(), 8);
+        assert_eq!(words[2] >> IMAGE_MASK_SHIFT, 0, "an image is no mask");
+        assert_eq!(words[3], 0);
+        assert_eq!(words[6] >> IMAGE_MASK_SHIFT, IMAGE_MASK_ALPHA);
+        assert_eq!(words[6] & 0xff, 255, "the image's own alpha");
+        // Premultiplied: red 255 at alpha 128 is 128.
+        assert_eq!(words[7], 0x8000_0080);
+    }
 
     #[test]
     fn ensure_image_quality_values() {

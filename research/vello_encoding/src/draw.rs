@@ -31,7 +31,10 @@ impl DrawTag {
     pub const SWEEP_GRADIENT: Self = Self(0x254);
 
     /// Image fill.
-    pub const IMAGE: Self = Self(0x28C); // info: 10, scene: 3
+    ///
+    /// Fork (rinch #2286): one more scene and info word than upstream, the
+    /// tint of an alpha-mask image ([`DrawImage::tint`]).
+    pub const IMAGE: Self = Self(0x2D0); // info: 11, scene: 4
 
     /// Blurred rounded rectangle.
     pub const BLUR_RECT: Self = Self(0x2d4); // info: 11, scene: 5 (DrawBlurRoundedRect)
@@ -164,10 +167,28 @@ pub struct DrawImage {
     pub xy: u32,
     /// Packed image dimensions.
     pub width_height: u32,
-    /// Packed quality, extend mode and 8-bit alpha (bits `qqxxyyaaaaaaaa`,
-    /// 18 unused prefix bits).
+    /// Packed mask mode, format, alpha type, quality, extend mode and 8-bit
+    /// alpha (bits `mmftqqxxyyaaaaaaaa`, 14 unused prefix bits).
+    ///
+    /// The mask mode (bits 16-17, a fork addition for rinch #2286) is one of
+    /// [`IMAGE_MASK_NONE`] and [`IMAGE_MASK_ALPHA`]; the value 2 is kept for a
+    /// per-channel (subpixel) mask.
     pub sample_alpha: u32,
+    /// Fork (rinch #2286): for an alpha-mask image, the premultiplied tint
+    /// the mask's coverage is painted in, packed as [`DrawColor::rgba`];
+    /// `0` for an ordinary image.
+    pub tint: u32,
 }
+
+/// [`DrawImage::sample_alpha`]'s mask mode: an ordinary image.
+pub const IMAGE_MASK_NONE: u32 = 0;
+
+/// [`DrawImage::sample_alpha`]'s mask mode: the image is coverage, read from
+/// its alpha channel, and paints [`DrawImage::tint`] in that coverage.
+pub const IMAGE_MASK_ALPHA: u32 = 1;
+
+/// The bit position of the mask mode in [`DrawImage::sample_alpha`].
+pub const IMAGE_MASK_SHIFT: u32 = 16;
 
 /// Draw data for a blurred rounded rectangle.
 #[derive(Clone, Copy, Debug, Default, Zeroable, Pod)]

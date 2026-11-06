@@ -21,7 +21,8 @@ const DRAWTAG_FILL_COLOR = 0x44u;
 const DRAWTAG_FILL_LIN_GRADIENT = 0x114u;
 const DRAWTAG_FILL_RAD_GRADIENT = 0x29cu;
 const DRAWTAG_FILL_SWEEP_GRADIENT = 0x254u;
-const DRAWTAG_FILL_IMAGE = 0x28Cu;
+// Fork (rinch #2286): info 11, scene 4, one word more than upstream (the tint).
+const DRAWTAG_FILL_IMAGE = 0x2D0u;
 const DRAWTAG_BLURRED_ROUNDED_RECT = 0x2d4u;
 const DRAWTAG_BEGIN_CLIP = 0x49u;
 const DRAWTAG_END_CLIP = 0x21u;
