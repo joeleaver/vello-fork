@@ -176,6 +176,7 @@ fn draw_leaf_main(
                         info[di + 7] = scene[dd as usize];
                         info[di + 8] = scene[dd as usize + 1];
                         info[di + 9] = scene[dd as usize + 2];
+                        info[di + 10] = scene[dd as usize + 3];
                     }
                     DrawTag::BLUR_RECT => {
                         info[di] = draw_flags;

@@ -431,6 +431,57 @@ impl Scene {
         self.fill(Fill::NonZero, transform, brush, None, &rect);
     }
 
+    /// Fills a shape with an alpha mask tinted by a colour (a fork addition,
+    /// rinch #2286): `mask`'s alpha channel is coverage, sampled as an image
+    /// brush is, and the fill paints `tint` in it. The mask's colour channels
+    /// are not read, so one mask serves every colour it is drawn in. A glyph
+    /// atlas draws each glyph this way.
+    pub fn fill_image_mask<'b>(
+        &mut self,
+        style: Fill,
+        transform: Affine,
+        mask: impl Into<ImageBrushRef<'b>>,
+        tint: Color,
+        brush_transform: Option<Affine>,
+        shape: &impl Shape,
+    ) {
+        let t = Transform::from_kurbo(&transform);
+        self.encoding.encode_transform(t);
+        self.encoding.encode_fill_style(style);
+        if self.encoding.encode_shape(shape, true) {
+            if let Some(brush_transform) = brush_transform
+                && self
+                    .encoding
+                    .encode_transform(Transform::from_kurbo(&(transform * brush_transform)))
+            {
+                self.encoding.swap_last_path_tags();
+            }
+            self.encoding.encode_image_mask(mask, 1.0, tint);
+            #[cfg(feature = "bump_estimate")]
+            self.estimator
+                .count_path(shape.path_elements(0.1), &t, None);
+        }
+    }
+
+    /// Draws an alpha mask tinted by `tint` (see [`Self::fill_image_mask`])
+    /// over the rectangle `(0, 0, width, height)` mapped by `transform`, as
+    /// [`Self::draw_image`] draws an image.
+    pub fn draw_image_mask<'b>(
+        &mut self,
+        mask: impl Into<ImageBrushRef<'b>>,
+        tint: Color,
+        transform: Affine,
+    ) {
+        let brush = mask.into();
+        let rect = Rect::new(
+            0.0,
+            0.0,
+            brush.image.width as f64,
+            brush.image.height as f64,
+        );
+        self.fill_image_mask(Fill::NonZero, transform, brush, tint, None, &rect);
+    }
+
     /// Returns a builder for encoding a glyph run.
     pub fn draw_glyphs(&mut self, font: &FontData) -> DrawGlyphs<'_> {
         // TODO: Integrate `BumpEstimator` with the glyph cache.

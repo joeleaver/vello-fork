@@ -828,7 +828,9 @@ fn read_image(cmd_ix: u32) -> CmdImage {
     let width_height = info[info_offset + 7u];
     let sample_alpha = info[info_offset + 8u];
     let alpha = f32(sample_alpha & 0xFFu) / 255.0;
-    let format = sample_alpha >> 15u;
+    let format = (sample_alpha >> 15u) & 0x1u;
+    let mask = (sample_alpha >> 16u) & 0x3u;
+    let tint = unpack4x8unorm(info[info_offset + 9u]);
     let alpha_type = (sample_alpha >> 14u) & 0x1u;
     let quality = (sample_alpha >> 12u) & 0x3u;
     let x_extend = (sample_alpha >> 10u) & 0x3u;
@@ -838,7 +840,7 @@ fn read_image(cmd_ix: u32) -> CmdImage {
     let y = f32(xy & 0xffffu);
     let width = f32(width_height >> 16u);
     let height = f32(width_height & 0xffffu);
-    return CmdImage(matrx, xlat, vec2(x, y), vec2(width, height), format, x_extend, y_extend, quality, alpha, alpha_type);
+    return CmdImage(matrx, xlat, vec2(x, y), vec2(width, height), format, x_extend, y_extend, quality, alpha, alpha_type, mask, tint);
 }
 
 fn read_end_clip(cmd_ix: u32) -> CmdEndClip {
@@ -850,6 +852,21 @@ fn read_end_clip(cmd_ix: u32) -> CmdEndClip {
 const PIXEL_FORMAT_RGBA: u32 = 0u;
 const PIXEL_FORMAT_BGRA: u32 = 1u;
 // Normalises subpixel order loaded from an image, based on the image's format.
+// Fork (rinch #2286): an image's mask modes. The value 2 is kept for a
+// per-channel (subpixel) coverage mask, which needs the destination and so is
+// not a function of the sample alone.
+const IMAGE_MASK_NONE: u32 = 0u;
+const IMAGE_MASK_ALPHA: u32 = 1u;
+
+// A sampled (premultiplied) texel as the colour it paints: itself, put in
+// the image's pixel format, or for an alpha mask the tint in its coverage.
+fn image_paint(pixel: vec4f, image: CmdImage) -> vec4f {
+    if image.mask == IMAGE_MASK_ALPHA {
+        return image.tint * pixel.a;
+    }
+    return pixel_format(pixel, image.format);
+}
+
 fn pixel_format(pixel: vec4f, format: u32) -> vec4f {
     switch format {
         case PIXEL_FORMAT_BGRA: {
@@ -1347,7 +1364,7 @@ fn main(
                                 let atlas_uv_clamped = clamp(atlas_uv, image.atlas_offset, atlas_max);
                                 // Nearest neighbor sampling
                                 let fg_rgba = maybe_premul_alpha(textureLoad(image_atlas, vec2<i32>(atlas_uv_clamped), 0), image.alpha_type);
-                                let fg_i = pixel_format(fg_rgba * area[i] * image.alpha, image.format);
+                                let fg_i = image_paint(fg_rgba, image) * (area[i] * image.alpha);
                                 rgba[i] = rgba[i] * (1.0 - fg_i.a) + fg_i;
                             }
                         }
@@ -1374,7 +1391,7 @@ fn main(
                                 let d = maybe_premul_alpha(textureLoad(image_atlas, vec2<i32>(uv_quad.zw), 0), image.alpha_type);
                                 // Bilinear sampling
                                 let fg_rgba = mix(mix(a, b, uv_frac.y), mix(c, d, uv_frac.y), uv_frac.x);
-                                let fg_i = pixel_format(fg_rgba * area[i] * image.alpha, image.format);
+                                let fg_i = image_paint(fg_rgba, image) * (area[i] * image.alpha);
                                 rgba[i] = rgba[i] * (1.0 - fg_i.a) + fg_i;
                             }
                         }
@@ -1389,7 +1406,7 @@ fn main(
                                 atlas_uv.y = extend_mode(atlas_uv.y, image.y_extend_mode, image.extents.y);
                                 atlas_uv = atlas_uv + image.atlas_offset;
                                 let fg_rgba = bicubic_sample(atlas_uv, image.atlas_offset, atlas_max, image.alpha_type);
-                                let fg_i = pixel_format(fg_rgba * area[i] * image.alpha, image.format);
+                                let fg_i = image_paint(fg_rgba, image) * (area[i] * image.alpha);
                                 rgba[i] = rgba[i] * (1.0 - fg_i.a) + fg_i;
                             }
                         }

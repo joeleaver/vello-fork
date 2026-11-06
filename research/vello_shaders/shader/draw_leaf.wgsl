@@ -257,6 +257,7 @@ fn main(
                     info[di + 7u] = scene[dd];
                     info[di + 8u] = scene[dd + 1u];
                     info[di + 9u] = scene[dd + 2u];
+                    info[di + 10u] = scene[dd + 3u];
                 }
                 case DRAWTAG_BLURRED_ROUNDED_RECT: {
                     info[di] = draw_flags;
