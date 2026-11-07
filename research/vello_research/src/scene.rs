@@ -463,6 +463,41 @@ impl Scene {
         }
     }
 
+    /// Draws a per-channel (subpixel, LCD) coverage mask tinted by `tint`
+    /// over the rectangle `(0, 0, width, height)` mapped by `transform` (a
+    /// fork addition, rinch #2286 stage 3). `mask`'s red, green and blue are
+    /// each that channel's coverage and its alpha their grey mean (stored
+    /// premultiplied). Over an opaque destination the tint is composited per
+    /// channel; where the destination is not opaque, the grey coverage is
+    /// painted as [`Self::draw_image_mask`] paints it. Only nearest sampling
+    /// ([`peniko::ImageQuality::Low`]) composites per channel.
+    ///
+    /// The per-channel composite is exact inside clips and layers whose
+    /// blend is normal source-over; inside any other blend the caller draws a
+    /// grey mask instead.
+    pub fn draw_image_lcd_mask<'b>(
+        &mut self,
+        mask: impl Into<ImageBrushRef<'b>>,
+        tint: Color,
+        transform: Affine,
+    ) {
+        let brush = mask.into();
+        let rect = Rect::new(
+            0.0,
+            0.0,
+            brush.image.width as f64,
+            brush.image.height as f64,
+        );
+        let t = Transform::from_kurbo(&transform);
+        self.encoding.encode_transform(t);
+        self.encoding.encode_fill_style(Fill::NonZero);
+        if self.encoding.encode_shape(&rect, true) {
+            self.encoding.encode_image_lcd_mask(brush, 1.0, tint);
+            #[cfg(feature = "bump_estimate")]
+            self.estimator.count_path(rect.path_elements(0.1), &t, None);
+        }
+    }
+
     /// Draws an alpha mask tinted by `tint` (see [`Self::fill_image_mask`])
     /// over the rectangle `(0, 0, width, height)` mapped by `transform`, as
     /// [`Self::draw_image`] draws an image.
