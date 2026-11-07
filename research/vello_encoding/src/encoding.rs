@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use crate::DrawBeginClip;
-use crate::draw::{IMAGE_MASK_ALPHA, IMAGE_MASK_NONE, IMAGE_MASK_SHIFT};
+use crate::draw::{IMAGE_MASK_ALPHA, IMAGE_MASK_LCD, IMAGE_MASK_NONE, IMAGE_MASK_SHIFT};
 
 use super::{
     DrawBlurRoundedRect, DrawColor, DrawImage, DrawLinearGradient, DrawRadialGradient,
@@ -445,6 +445,23 @@ impl Encoding {
         self.encode_image_with_mask(brush.into(), alpha, IMAGE_MASK_ALPHA, tint.rgba);
     }
 
+    /// Encodes a per-channel (subpixel, LCD) mask image brush (a fork
+    /// addition, rinch #2286 stage 3): the image's red, green and blue are
+    /// each that channel's coverage and its alpha their grey mean, and the
+    /// brush paints `tint` per channel over an opaque destination, grey
+    /// coverage elsewhere ([`IMAGE_MASK_LCD`]). Drawn per channel only with
+    /// [`peniko::ImageQuality::Low`] (nearest); other samplers draw the grey
+    /// coverage.
+    pub fn encode_image_lcd_mask<'b>(
+        &mut self,
+        brush: impl Into<ImageBrushRef<'b>>,
+        alpha: f32,
+        tint: impl Into<DrawColor>,
+    ) {
+        let tint: DrawColor = tint.into();
+        self.encode_image_with_mask(brush.into(), alpha, IMAGE_MASK_LCD, tint.rgba);
+    }
+
     fn encode_image_with_mask(
         &mut self,
         brush: ImageBrushRef<'_>,
@@ -673,6 +690,23 @@ mod tests {
         assert_eq!(words[6] & 0xff, 255, "the image's own alpha");
         // Premultiplied: red 255 at alpha 128 is 128.
         assert_eq!(words[7], 0x8000_0080);
+        // The subpixel mask (stage 3): mode 2, the same tint word.
+        let lcd = ImageData {
+            data: Blob::new(Arc::new(vec![0_u8; 4])),
+            format: ImageFormat::Rgba8,
+            alpha_type: ImageAlphaType::AlphaPremultiplied,
+            width: 1,
+            height: 1,
+        };
+        enc.encode_image_lcd_mask(
+            &ImageBrush::new(lcd),
+            1.0,
+            AlphaColor::<peniko::color::Srgb>::from_rgba8(0, 0, 255, 255),
+        );
+        let words: &[u32] = bytemuck::cast_slice(&enc.draw_data);
+        assert_eq!(words.len(), 12);
+        assert_eq!(words[10] >> IMAGE_MASK_SHIFT, super::IMAGE_MASK_LCD);
+        assert_eq!(words[11], 0xff_ff_00_00);
     }
 
     #[test]

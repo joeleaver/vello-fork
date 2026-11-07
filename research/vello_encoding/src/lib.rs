@@ -55,7 +55,7 @@ pub use config::{
 pub use draw::{
     DRAW_INFO_FLAGS_FILL_RULE_BIT, DrawBbox, DrawBeginClip, DrawBlurRoundedRect, DrawColor,
     DrawImage, DrawLinearGradient, DrawMonoid, DrawRadialGradient, DrawSweepGradient, DrawTag,
-    IMAGE_MASK_ALPHA, IMAGE_MASK_NONE, IMAGE_MASK_SHIFT,
+    IMAGE_MASK_ALPHA, IMAGE_MASK_LCD, IMAGE_MASK_NONE, IMAGE_MASK_SHIFT,
 };
 pub use encoding::{Encoding, Resources, StreamOffsets};
 pub use glyph::{FontEmbolden, Glyph, GlyphRun};

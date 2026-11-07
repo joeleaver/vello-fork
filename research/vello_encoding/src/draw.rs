@@ -171,8 +171,7 @@ pub struct DrawImage {
     /// alpha (bits `mmftqqxxyyaaaaaaaa`, 14 unused prefix bits).
     ///
     /// The mask mode (bits 16-17, a fork addition for rinch #2286) is one of
-    /// [`IMAGE_MASK_NONE`] and [`IMAGE_MASK_ALPHA`]; the value 2 is kept for a
-    /// per-channel (subpixel) mask.
+    /// [`IMAGE_MASK_NONE`], [`IMAGE_MASK_ALPHA`] and [`IMAGE_MASK_LCD`].
     pub sample_alpha: u32,
     /// Fork (rinch #2286): for an alpha-mask image, the premultiplied tint
     /// the mask's coverage is painted in, packed as [`DrawColor::rgba`];
@@ -186,6 +185,14 @@ pub const IMAGE_MASK_NONE: u32 = 0;
 /// [`DrawImage::sample_alpha`]'s mask mode: the image is coverage, read from
 /// its alpha channel, and paints [`DrawImage::tint`] in that coverage.
 pub const IMAGE_MASK_ALPHA: u32 = 1;
+
+/// [`DrawImage::sample_alpha`]'s mask mode (rinch #2286 stage 3): the image is
+/// per-channel (subpixel, LCD) coverage, each of red, green and blue the
+/// coverage of that channel and alpha their grey mean, and paints
+/// [`DrawImage::tint`] per channel over an opaque destination. Where the
+/// destination is not opaque, and with a sampler other than nearest, it is the
+/// grey coverage in the alpha.
+pub const IMAGE_MASK_LCD: u32 = 2;
 
 /// The bit position of the mask mode in [`DrawImage::sample_alpha`].
 pub const IMAGE_MASK_SHIFT: u32 = 16;

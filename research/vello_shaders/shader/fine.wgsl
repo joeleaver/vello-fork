@@ -851,22 +851,73 @@ fn read_end_clip(cmd_ix: u32) -> CmdEndClip {
 
 const PIXEL_FORMAT_RGBA: u32 = 0u;
 const PIXEL_FORMAT_BGRA: u32 = 1u;
-// Normalises subpixel order loaded from an image, based on the image's format.
-// Fork (rinch #2286): an image's mask modes. The value 2 is kept for a
-// per-channel (subpixel) coverage mask, which needs the destination and so is
-// not a function of the sample alone.
+// Fork (rinch #2286): an image's mask modes.
 const IMAGE_MASK_NONE: u32 = 0u;
 const IMAGE_MASK_ALPHA: u32 = 1u;
+// A per-channel (subpixel, LCD) coverage mask: each of the texel's red, green
+// and blue is that channel's coverage, and its alpha their grey mean. It needs
+// the destination pixel, so it is composited by `lcd_composite`, not
+// `image_paint`.
+const IMAGE_MASK_LCD: u32 = 2u;
+// From this alpha the pixel under an LCD mask counts as opaque (half an 8-bit
+// step below 1).
+const LCD_OPAQUE: f32 = 0.998;
 
 // A sampled (premultiplied) texel as the colour it paints: itself, put in
-// the image's pixel format, or for an alpha mask the tint in its coverage.
+// the image's pixel format, or for an alpha mask the tint in its coverage. An
+// LCD mask drawn here (a sampler other than nearest) is its grey coverage.
 fn image_paint(pixel: vec4f, image: CmdImage) -> vec4f {
-    if image.mask == IMAGE_MASK_ALPHA {
+    if image.mask != IMAGE_MASK_NONE {
         return image.tint * pixel.a;
     }
     return pixel_format(pixel, image.format);
 }
 
+// Fork (rinch #2286): composite an LCD mask texel `cov`, painted in the
+// premultiplied `tint` at coverage `k`, over `top`, the current layer's pixel.
+//
+// Per-channel coverage needs an opaque destination: an RGBA pixel cannot hold
+// three alphas. The destination is `top` over the backdrops of the open clips
+// and layers, from the innermost out, until one makes it opaque (the CPU side
+// draws LCD only where every open layer composites source-over, so this is the
+// pixel the layers will show). That pixel then takes the text per channel,
+// `dst * (1 - c * tint.a) + tint * c`, and is written into the current layer
+// as an opaque pixel: compositing a source-over layer is linear in its
+// backdrop, so folding the backdrop into the layer gives what the layer
+// stack would give. Where nothing below is opaque (a transparent window, a
+// slice rendered over transparent) the mask is grey coverage, `cov.a`.
+fn lcd_composite(
+    top: vec4f,
+    cov: vec4f,
+    tint: vec4f,
+    k: f32,
+    stack: ptr<function, array<array<vec2<u32>, PIXELS_PER_THREAD>, BLEND_STACK_SPLIT>>,
+    depth: u32,
+    i: u32,
+    spill_base: u32,
+) -> vec4f {
+    var dst = top;
+    var d = depth;
+    while dst.a < LCD_OPAQUE && d > 0u {
+        d -= 1u;
+        var packed: vec2<u32>;
+        if d < BLEND_STACK_SPLIT {
+            packed = (*stack)[d][i];
+        } else {
+            let s = spill_base + 2u * ((d - BLEND_STACK_SPLIT) * TILE_WIDTH * TILE_HEIGHT + i);
+            packed = vec2(blend_spill[s], blend_spill[s + 1u]);
+        }
+        dst = dst + unpack_backdrop(packed) * (1.0 - dst.a);
+    }
+    if dst.a < LCD_OPAQUE {
+        let fg = tint * (cov.a * k);
+        return top * (1.0 - fg.a) + fg;
+    }
+    let c = cov.rgb * k;
+    return vec4(dst.rgb * (1.0 - c * tint.a) + tint.rgb * c, 1.0);
+}
+
+// Normalises subpixel order loaded from an image, based on the image's format.
 fn pixel_format(pixel: vec4f, format: u32) -> vec4f {
     switch format {
         case PIXEL_FORMAT_BGRA: {
@@ -1364,8 +1415,14 @@ fn main(
                                 let atlas_uv_clamped = clamp(atlas_uv, image.atlas_offset, atlas_max);
                                 // Nearest neighbor sampling
                                 let fg_rgba = maybe_premul_alpha(textureLoad(image_atlas, vec2<i32>(atlas_uv_clamped), 0), image.alpha_type);
-                                let fg_i = image_paint(fg_rgba, image) * (area[i] * image.alpha);
-                                rgba[i] = rgba[i] * (1.0 - fg_i.a) + fg_i;
+                                if image.mask == IMAGE_MASK_LCD {
+                                    // Fork (rinch #2286): per-channel coverage.
+                                    let local_tile_ix = local_id.x * PIXELS_PER_THREAD + local_id.y * TILE_WIDTH;
+                                    rgba[i] = lcd_composite(rgba[i], fg_rgba, image.tint, area[i] * image.alpha, &blend_stack, clip_depth, i, blend_offset + 2u * local_tile_ix);
+                                } else {
+                                    let fg_i = image_paint(fg_rgba, image) * (area[i] * image.alpha);
+                                    rgba[i] = rgba[i] * (1.0 - fg_i.a) + fg_i;
+                                }
                             }
                         }
                     }

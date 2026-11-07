@@ -104,7 +104,8 @@ struct CmdImage {
     alpha: f32,
     alpha_type: u32,
     // Fork (rinch #2286): IMAGE_MASK_NONE, or IMAGE_MASK_ALPHA with `tint`
-    // the premultiplied colour painted in the image's alpha.
+    // the premultiplied colour painted in the image's alpha, or IMAGE_MASK_LCD
+    // with `tint` painted in each channel's coverage (fine.wgsl).
     mask: u32,
     tint: vec4<f32>,
 }
