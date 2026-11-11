@@ -19,7 +19,6 @@ use crate::{
 };
 use vello_shaders::cpu::CpuBinding;
 
-#[cfg(not(target_arch = "wasm32"))]
 /// A compute shader's code: its WGSL, and with the `naga_ir` feature the naga module parsed from
 /// it at build time (rinch #2468).
 pub(crate) struct ShaderCode {
@@ -50,6 +49,7 @@ impl ShaderCode {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct UninitialisedShader {
     code: ShaderCode,
     label: &'static str,
