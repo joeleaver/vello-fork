@@ -71,6 +71,127 @@ pub(crate) struct WgpuEngine {
     /// The `Texture` should have the same size as the `Image`.
     pub(crate) image_overrides: HashMap<u64, wgpu::TexelCopyTextureInfoBase<Texture>>,
     pipeline_cache: Option<PipelineCache>,
+    pub(crate) bind_groups: BindGroupCache,
+}
+
+/// Bind groups made by earlier recordings, keyed by the layout and the exact resources they bind
+/// (rinch #2469).
+///
+/// A frame binds the same pooled buffers to the same shaders as the frame before it: the pool
+/// hands each label's buffer back in the same order. Stock Vello made every one of those bind
+/// groups again, every frame, which was about a third of the instructions of a small surface's
+/// `render_to_texture`. A group not used for [`KEEP_BIND_GROUPS_FOR_RECORDINGS`] recordings is dropped, so
+/// the cache holds only what recent frames bound. (A bind group keeps what it binds alive, so the
+/// cache delays the release of a buffer the pool lets go by at most that many recordings.)
+#[derive(Default)]
+pub(crate) struct BindGroupCache {
+    pub(crate) groups: HashMap<BindGroupKey, CachedBindGroup>,
+    /// Recordings run so far.
+    generation: u64,
+    /// Bind groups made, for tests.
+    #[cfg(test)]
+    pub(crate) created: u64,
+}
+
+/// Recordings a bind group survives unused: a window's split slices and partial frames each run
+/// their own recordings, so this is several frames' worth.
+pub(crate) const KEEP_BIND_GROUPS_FOR_RECORDINGS: u64 = 16;
+
+#[derive(PartialEq, Eq, Hash)]
+pub(crate) struct BindGroupKey {
+    layout: BindGroupLayout,
+    resources: Vec<BoundResource>,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+enum BoundResource {
+    Buffer(Buffer, u64, Option<core::num::NonZeroU64>),
+    View(TextureView),
+}
+
+pub(crate) struct CachedBindGroup {
+    group: BindGroup,
+    last_used: u64,
+}
+
+impl BindGroupCache {
+    /// The group binding `key`'s resources: the cached one, or a new one, which is cached when
+    /// `cacheable`. A group that binds a resource the caller passed in for this render (its
+    /// target view, say) is not: the caller may make a new one every frame (rinch makes a view a
+    /// frame and a texture a resize), and a cached group would keep each alive, texture and all,
+    /// for [`KEEP_BIND_GROUPS_FOR_RECORDINGS`] recordings.
+    fn get_or_create(&mut self, device: &Device, key: BindGroupKey, cacheable: bool) -> BindGroup {
+        if !cacheable {
+            #[cfg(test)]
+            {
+                self.created += 1;
+            }
+            return Self::create(device, &key);
+        }
+        let generation = self.generation;
+        match self.groups.entry(key) {
+            Entry::Occupied(mut o) => {
+                o.get_mut().last_used = generation;
+                o.get().group.clone()
+            }
+            Entry::Vacant(v) => {
+                let group = Self::create(device, v.key());
+                #[cfg(test)]
+                {
+                    self.created += 1;
+                }
+                v.insert(CachedBindGroup {
+                    group: group.clone(),
+                    last_used: generation,
+                });
+                group
+            }
+        }
+    }
+
+    fn create(device: &Device, key: &BindGroupKey) -> BindGroup {
+        let entries = key
+            .resources
+            .iter()
+            .enumerate()
+            .map(|(i, r)| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: match r {
+                    BoundResource::Buffer(buffer, offset, size) => {
+                        wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer,
+                            offset: *offset,
+                            size: *size,
+                        })
+                    }
+                    BoundResource::View(view) => wgpu::BindingResource::TextureView(view),
+                },
+            })
+            .collect::<Vec<_>>();
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &key.layout,
+            entries: &entries,
+        })
+    }
+
+    /// Drops the groups that bind `view`, whose texture is being destroyed: they could never be
+    /// used again, and would keep the texture's handle for nothing.
+    fn forget_view(&mut self, view: &TextureView) {
+        self.groups.retain(|key, _| {
+            !key.resources
+                .iter()
+                .any(|r| matches!(r, BoundResource::View(v) if v == view))
+        });
+    }
+
+    /// Ends a recording: drops the groups no recording has used for a while.
+    pub(crate) fn end_recording(&mut self) {
+        self.generation += 1;
+        let generation = self.generation;
+        self.groups
+            .retain(|_, g| g.last_used + KEEP_BIND_GROUPS_FOR_RECORDINGS > generation);
+    }
 }
 
 enum PipelineState {
@@ -151,6 +272,8 @@ struct BufferProperties {
 #[derive(Default)]
 struct ResourcePool {
     bufs: HashMap<BufferProperties, Vec<Buffer>>,
+    /// Whether `get_buf` let superseded buffers go since the bind-group cache last looked.
+    released: bool,
 }
 
 /// The transient bind map contains short-lifetime resources.
@@ -589,6 +712,7 @@ impl WgpuEngine {
                             let bind_group = transient_map.create_bind_group(
                                 &mut self.bind_map,
                                 &mut self.pool,
+                                &mut self.bind_groups,
                                 device,
                                 queue,
                                 &mut encoder,
@@ -640,6 +764,7 @@ impl WgpuEngine {
                             let bind_group = transient_map.create_bind_group(
                                 &mut self.bind_map,
                                 &mut self.pool,
+                                &mut self.bind_groups,
                                 device,
                                 queue,
                                 &mut encoder,
@@ -691,6 +816,7 @@ impl WgpuEngine {
                     let bind_group = transient_map.create_bind_group(
                         &mut self.bind_map,
                         &mut self.pool,
+                        &mut self.bind_groups,
                         device,
                         queue,
                         &mut encoder,
@@ -785,6 +911,12 @@ impl WgpuEngine {
         #[cfg(feature = "wgpu-profiler")]
         profiler.resolve_queries(&mut encoder);
         queue.submit(Some(encoder.finish()));
+        // A cached group would keep a buffer the pool let go alive: start the cache afresh when
+        // that happens (once per new high-water mark of a growing buffer).
+        if std::mem::take(&mut self.pool.released) {
+            self.bind_groups.groups.clear();
+        }
+        self.bind_groups.end_recording();
         for id in free_bufs {
             if let Some(buf) = self.bind_map.buf_map.remove(&id)
                 && let MaterializedBuffer::Gpu(gpu_buf) = buf.buffer
@@ -798,7 +930,8 @@ impl WgpuEngine {
             }
         }
         for id in free_images {
-            if let Some((texture, _view)) = self.bind_map.image_map.remove(&id) {
+            if let Some((texture, view)) = self.bind_map.image_map.remove(&id) {
+                self.bind_groups.forget_view(&view);
                 // TODO: have a pool to avoid needless re-allocation
                 texture.destroy();
             }
@@ -1036,7 +1169,9 @@ impl ResourcePool {
         // A buffer that only grows (`GROWING_BUFFERS`) is never asked for at
         // its old sizes again: release those.
         if crate::render::GROWING_BUFFERS.contains(&name) {
+            let before = self.bufs.len();
             self.bufs.retain(|kept, _| !supersedes(&props, kept));
+            self.released |= self.bufs.len() != before;
         }
         device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(name),
@@ -1129,6 +1264,7 @@ impl<'a> TransientBindMap<'a> {
         &mut self,
         bind_map: &mut BindMap,
         pool: &mut ResourcePool,
+        cache: &mut BindGroupCache,
         device: &Device,
         queue: &Queue,
         encoder: &mut CommandEncoder,
@@ -1204,19 +1340,22 @@ impl<'a> TransientBindMap<'a> {
                 }
             }
         }
-        let entries = bindings
+        // Resources the caller passed in for this render are not ours to keep alive.
+        let cacheable = !bindings.iter().any(|proxy| match proxy {
+            ResourceProxy::Buffer(proxy) | ResourceProxy::BufferRange { proxy, .. } => {
+                matches!(self.bufs.get(&proxy.id), Some(TransientBuf::Gpu(_)))
+            }
+            ResourceProxy::Image(proxy) => self.images.contains_key(&proxy.id),
+        });
+        let resources = bindings
             .iter()
-            .enumerate()
-            .map(|(i, proxy)| match proxy {
+            .map(|proxy| match proxy {
                 ResourceProxy::Buffer(proxy) => {
                     let buf = match self.bufs.get(&proxy.id) {
                         Some(TransientBuf::Gpu(b)) => b,
                         _ => bind_map.get_gpu_buf(proxy.id).unwrap(),
                     };
-                    wgpu::BindGroupEntry {
-                        binding: i as u32,
-                        resource: buf.as_entire_binding(),
-                    }
+                    BoundResource::Buffer((*buf).clone(), 0, None)
                 }
                 ResourceProxy::BufferRange {
                     proxy,
@@ -1227,14 +1366,11 @@ impl<'a> TransientBindMap<'a> {
                         Some(TransientBuf::Gpu(b)) => b,
                         _ => bind_map.get_gpu_buf(proxy.id).unwrap(),
                     };
-                    wgpu::BindGroupEntry {
-                        binding: i as u32,
-                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: buf,
-                            offset: *offset,
-                            size: core::num::NonZeroU64::new(*size),
-                        }),
-                    }
+                    BoundResource::Buffer(
+                        (*buf).clone(),
+                        *offset,
+                        core::num::NonZeroU64::new(*size),
+                    )
                 }
                 ResourceProxy::Image(proxy) => {
                     let view = self
@@ -1243,18 +1379,18 @@ impl<'a> TransientBindMap<'a> {
                         .copied()
                         .or_else(|| bind_map.image_map.get(&proxy.id).map(|v| &v.1))
                         .unwrap();
-                    wgpu::BindGroupEntry {
-                        binding: i as u32,
-                        resource: wgpu::BindingResource::TextureView(view),
-                    }
+                    BoundResource::View(view.clone())
                 }
             })
             .collect::<Vec<_>>();
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout,
-            entries: &entries,
-        })
+        cache.get_or_create(
+            device,
+            BindGroupKey {
+                layout: layout.clone(),
+                resources,
+            },
+            cacheable,
+        )
     }
 
     fn create_cpu_resources(
