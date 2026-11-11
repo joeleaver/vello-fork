@@ -975,6 +975,27 @@ fn extend_mode(t: f32, mode: u32, max: f32) -> f32 {
     }
 }
 
+// Fork (rinch #1661, #1755): the texel a bilinear tap at integer texel index `i` reads
+// along an axis of `n` texels: clamped (pad), wrapped (repeat) or mirrored (reflect, the
+// texel sequence 0..n-1, n-1..0). Always within [0, n - 1].
+fn extend_texel(i: f32, mode: u32, n: f32) -> f32 {
+    var t: f32;
+    switch mode {
+        case EXTEND_REPEAT: {
+            t = i - n * floor(i / n);
+        }
+        case EXTEND_REFLECT: {
+            let p = 2.0 * n;
+            let m = i - p * floor(i / p);
+            t = select(m, p - 1.0 - m, m >= n);
+        }
+        case EXTEND_PAD, default: {
+            t = i;
+        }
+    }
+    return clamp(t, 0.0, n - 1.0);
+}
+
 // Cubic resampler logic borrowed from Skia (same as CPU cubic_resampler function)
 // Mitchell-Netravali cubic filter coefficients with parameters B=1/3 and C=1/3
 const MF: array<vec4<f32>, 4> = array<vec4<f32>, 4>(
@@ -1432,20 +1453,25 @@ fn main(
                             if area[i] != 0.0 {
                                 // Use pixel centers (+0.5) rather than pixel corners for correct sampling
                                 let my_xy = vec2(xy.x + f32(i) + 0.5, xy.y + 0.5);
-                                var atlas_uv = image.matrx.xy * my_xy.x + image.matrx.zw * my_xy.y + image.xlat;
-                                atlas_uv.x = extend_mode(atlas_uv.x, image.x_extend_mode, image.extents.x);
-                                atlas_uv.y = extend_mode(atlas_uv.y, image.y_extend_mode, image.extents.y);
-                                atlas_uv = atlas_uv + image.atlas_offset - vec2(0.5);
+                                // Fork (rinch #1661, #1755): the extend mode is applied to each of the
+                                // four taps, not to the sample point, as GL_REPEAT and Skia do. Applied to
+                                // the point and clamped afterwards, a repeating image read its edge texel
+                                // alone in the half-texel band at every tile boundary instead of blending
+                                // texel `w - 1` with texel 0, so a scaled or sub-pixel-placed pattern had a
+                                // hard seam at each tile edge. Pad still clamps (the same pixels as before).
+                                let uv = image.matrx.xy * my_xy.x + image.matrx.zw * my_xy.y + image.xlat - vec2(0.5);
+                                let lo = floor(uv);
+                                let uv_frac = uv - lo;
+                                let x0 = extend_texel(lo.x, image.x_extend_mode, image.extents.x);
+                                let x1 = extend_texel(lo.x + 1.0, image.x_extend_mode, image.extents.x);
+                                let y0 = extend_texel(lo.y, image.y_extend_mode, image.extents.y);
+                                let y1 = extend_texel(lo.y + 1.0, image.y_extend_mode, image.extents.y);
                                 // TODO: If the image couldn't be added to the atlas (i.e. was too big), this isn't robust
-                                let atlas_uv_clamped = clamp(atlas_uv, image.atlas_offset, atlas_max);
-                                // We know that the floor and ceil are within the atlas area because atlas_max and
-                                // atlas_offset are integers
-                                let uv_quad = vec4(floor(atlas_uv_clamped), ceil(atlas_uv_clamped));
-                                let uv_frac = fract(atlas_uv);
-                                let a = maybe_premul_alpha(textureLoad(image_atlas, vec2<i32>(uv_quad.xy), 0), image.alpha_type);
-                                let b = maybe_premul_alpha(textureLoad(image_atlas, vec2<i32>(uv_quad.xw), 0), image.alpha_type);
-                                let c = maybe_premul_alpha(textureLoad(image_atlas, vec2<i32>(uv_quad.zy), 0), image.alpha_type);
-                                let d = maybe_premul_alpha(textureLoad(image_atlas, vec2<i32>(uv_quad.zw), 0), image.alpha_type);
+                                let o = image.atlas_offset;
+                                let a = maybe_premul_alpha(textureLoad(image_atlas, vec2<i32>(o + vec2(x0, y0)), 0), image.alpha_type);
+                                let b = maybe_premul_alpha(textureLoad(image_atlas, vec2<i32>(o + vec2(x0, y1)), 0), image.alpha_type);
+                                let c = maybe_premul_alpha(textureLoad(image_atlas, vec2<i32>(o + vec2(x1, y0)), 0), image.alpha_type);
+                                let d = maybe_premul_alpha(textureLoad(image_atlas, vec2<i32>(o + vec2(x1, y1)), 0), image.alpha_type);
                                 // Bilinear sampling
                                 let fg_rgba = mix(mix(a, b, uv_frac.y), mix(c, d, uv_frac.y), uv_frac.x);
                                 let fg_i = image_paint(fg_rgba, image) * (area[i] * image.alpha);
