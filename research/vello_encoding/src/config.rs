@@ -733,7 +733,7 @@ mod bump_sizes_tests {
     /// counters back sizes them, for an empty scene.
     fn exact_config(w: u32, h: u32) -> ConfigUniform {
         let layout = Layout::default();
-        let sizes = BumpSizes::initial(&layout, w, h, u64::MAX);
+        let sizes = BumpSizes::initial(&layout, 0, w, h, u64::MAX);
         RenderConfig::new(&layout, w, h, &peniko::Color::WHITE)
             .with_exact_bump_sizes(&sizes)
             .gpu
@@ -742,7 +742,7 @@ mod bump_sizes_tests {
     #[test]
     fn exact_sizes_set_vello_s_aside_and_at_least_keeps_them() {
         let small = exact_config(1280, 40);
-        let initial = BumpSizes::initial(&Layout::default(), 1280, 40, u64::MAX);
+        let initial = BumpSizes::initial(&Layout::default(), 0, 1280, 40, u64::MAX);
         assert_eq!(BumpSizes::of(&small), initial);
         assert!(small.lines_size < 1 << 21 && small.ptcl_size < 1 << 23);
         // The path without readback keeps Vello's sizes as its least.

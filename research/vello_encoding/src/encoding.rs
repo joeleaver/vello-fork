@@ -49,6 +49,10 @@ pub struct Encoding {
     pub n_clips: u32,
     /// Number of unclosed clips/layers.
     pub n_open_clips: u32,
+    /// The most clips/layers open at once: how deep they nest. Kept as the
+    /// encoding is built, so a renderer sizing its blend spill for it
+    /// (`BumpSizes::initial`) need not scan the draw tags.
+    pub max_open_clips: u32,
     /// Flags that capture the current state of the encoding.
     pub flags: u32,
 }
@@ -87,6 +91,7 @@ impl Encoding {
         self.n_path_segments = 0;
         self.n_clips = 0;
         self.n_open_clips = 0;
+        self.max_open_clips = 0;
         self.flags = 0;
         self.resources.reset();
     }
@@ -160,6 +165,10 @@ impl Encoding {
         self.n_paths += other.n_paths;
         self.n_path_segments += other.n_path_segments;
         self.n_clips += other.n_clips;
+        // `other`'s clips nest inside the ones open here.
+        self.max_open_clips = self
+            .max_open_clips
+            .max(self.n_open_clips + other.max_open_clips);
         self.n_open_clips += other.n_open_clips;
         self.flags = other.flags;
         if let Some(transform) = *transform {
@@ -528,6 +537,7 @@ impl Encoding {
             .extend_from_slice(bytemuck::cast_slice(bytemuck::bytes_of(&parameters)));
         self.n_clips += 1;
         self.n_open_clips += 1;
+        self.max_open_clips = self.max_open_clips.max(self.n_open_clips);
     }
 
     /// Encodes an end clip command.
@@ -729,5 +739,33 @@ mod tests {
         match Extend::Pad {
             Extend::Pad | Extend::Repeat | Extend::Reflect => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod max_open_clips_tests {
+    use super::*;
+
+    #[test]
+    fn counts_the_deepest_nesting_through_appends() {
+        let mut inner = Encoding::new();
+        for _ in 0..3 {
+            inner.encode_begin_clip(DrawBeginClip::default());
+        }
+        for _ in 0..3 {
+            inner.encode_end_clip();
+        }
+        assert_eq!(inner.max_open_clips, 3);
+        let mut outer = Encoding::new();
+        outer.encode_begin_clip(DrawBeginClip::default());
+        outer.encode_begin_clip(DrawBeginClip::default());
+        outer.append(&inner, &None);
+        assert_eq!(outer.max_open_clips, 5, "nested inside two open clips");
+        outer.encode_end_clip();
+        outer.encode_end_clip();
+        outer.append(&inner, &None);
+        assert_eq!(outer.max_open_clips, 5, "a sibling at depth 3 is shallower");
+        outer.reset();
+        assert_eq!(outer.max_open_clips, 0);
     }
 }

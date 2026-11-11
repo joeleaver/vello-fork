@@ -211,6 +211,7 @@ impl Render {
             (Some(max_bytes), min) => {
                 let sizes = vello_encoding::BumpSizes::initial(
                     &layout,
+                    encoding.max_open_clips,
                     params.width,
                     params.height,
                     max_bytes,
