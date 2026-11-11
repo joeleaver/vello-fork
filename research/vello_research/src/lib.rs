@@ -750,7 +750,7 @@ impl Renderer {
             };
             let config = &readback.config;
             self.bump_reports
-                .record(&bump, config, readback.max_open_clips);
+                .record(&bump, config, readback.max_open_clips, max_bytes);
             let (width, height) = (config.target_width, config.target_height);
             let had = vello_encoding::BumpSizes::of(config);
             // What the initial sizes are derived from, beside what the frame
