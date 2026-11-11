@@ -54,7 +54,11 @@ fn write_types(buf: &mut String, shaders: &[(String, ShaderInfo)]) -> Result<(),
     writeln!(buf, "}}")?;
     writeln!(buf, "impl<'a> Shaders<'a> {{")?;
     writeln!(buf, "    /// Every shader, in name order.")?;
-    writeln!(buf, "    pub fn all(&self) -> [&ComputeShader<'a>; {}] {{", shaders.len())?;
+    writeln!(
+        buf,
+        "    pub fn all(&self) -> [&ComputeShader<'a>; {}] {{",
+        shaders.len()
+    )?;
     write!(buf, "        [")?;
     for (name, _) in shaders {
         write!(buf, "&self.{name}, ")?;

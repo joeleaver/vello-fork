@@ -42,6 +42,13 @@
     reason = "Deferred, only apply in some feature sets so not expect"
 )]
 
+// Dev-dependencies used only by `tests/naga_ir.rs` (`naga` is the library's
+// own with `compile`): suppress `unused_crate_dependencies` in its own tests.
+#[cfg(all(test, not(feature = "compile")))]
+use naga as _;
+#[cfg(test)]
+use postcard as _;
+
 mod types;
 
 #[cfg(feature = "compile")]
