@@ -1050,9 +1050,12 @@ mod bind_group_cache_tests {
 
     fn gpu() -> (Device, Queue) {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let adapter = pollster::block_on(instance.request_adapter(&Default::default()))
-            .expect("these tests need a GPU adapter");
-        pollster::block_on(adapter.request_device(&Default::default())).expect("device")
+        let adapter = pollster::block_on(
+            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
+        )
+        .expect("these tests need a GPU adapter");
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+            .expect("device")
     }
 
     fn scene(dx: f64) -> Scene {
@@ -1102,14 +1105,14 @@ mod bind_group_cache_tests {
             usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        let view = texture.create_view(&Default::default());
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let params = RenderParams {
             base_color: Color::BLACK,
             width: 256,
             height: 64,
             antialiasing_method: AaConfig::Area,
         };
-        let mut render = |r: &mut Renderer, dx: f64| {
+        let render = |r: &mut Renderer, dx: f64| {
             r.render_to_texture(&device, &queue, &scene(dx), &view, &params)
                 .unwrap();
             device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
@@ -1136,5 +1139,72 @@ mod bind_group_cache_tests {
             renderer.engine.bind_groups.end_recording();
         }
         assert_eq!(renderer.engine.bind_groups.groups.len(), 0);
+    }
+
+    fn renderer(device: &Device) -> Renderer {
+        Renderer::new(
+            device,
+            RendererOptions {
+                use_cpu: false,
+                antialiasing_support: AaSupport::area_only(),
+                num_init_threads: NonZeroUsize::new(1),
+                pipeline_cache: None,
+            },
+        )
+        .unwrap()
+    }
+
+    /// A target texture made per frame, as a window being resized makes them, is released once
+    /// the caller drops it: no cached group holds its view (the review of joeleaver/vello-fork#10
+    /// measured 16 MB more GPU memory per 1440p resize while one did).
+    #[test]
+    #[ignore = "needs a GPU adapter with an allocator report (Vulkan, DX12, Metal)"]
+    fn a_target_made_per_frame_is_released() {
+        let (device, queue) = gpu();
+        let mut renderer = renderer(&device);
+        let (w, h) = (1024, 1024);
+        let params = RenderParams {
+            base_color: Color::BLACK,
+            width: w,
+            height: h,
+            antialiasing_method: AaConfig::Area,
+        };
+        let frame = |r: &mut Renderer, dx: f64| {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("per-frame target"),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            r.render_to_texture(&device, &queue, &scene(dx), &view, &params)
+                .unwrap();
+            drop((view, texture));
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            let _ = r.check_frames(&device);
+            device
+                .generate_allocator_report()
+                .expect("an allocator report")
+                .total_allocated_bytes
+        };
+        frame(&mut renderer, 0.0);
+        let settled = frame(&mut renderer, 1.0);
+        let mut last = settled;
+        for i in 0..12 {
+            last = frame(&mut renderer, 2.0 + f64::from(i));
+        }
+        // Each target is 4 MiB: twelve kept alive would be 48 MiB more.
+        assert!(
+            last <= settled + (2 << 20),
+            "GPU memory grew from {settled} to {last} bytes over 12 per-frame targets"
+        );
     }
 }

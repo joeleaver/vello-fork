@@ -115,7 +115,19 @@ pub(crate) struct CachedBindGroup {
 }
 
 impl BindGroupCache {
-    fn get_or_create(&mut self, device: &Device, key: BindGroupKey) -> BindGroup {
+    /// The group binding `key`'s resources: the cached one, or a new one, which is cached when
+    /// `cacheable`. A group that binds a resource the caller passed in for this render (its
+    /// target view, say) is not: the caller may make a new one every frame (rinch makes a view a
+    /// frame and a texture a resize), and a cached group would keep each alive, texture and all,
+    /// for [`KEEP_BIND_GROUPS_FOR_RECORDINGS`] recordings.
+    fn get_or_create(&mut self, device: &Device, key: BindGroupKey, cacheable: bool) -> BindGroup {
+        if !cacheable {
+            #[cfg(test)]
+            {
+                self.created += 1;
+            }
+            return Self::create(device, &key);
+        }
         let generation = self.generation;
         match self.groups.entry(key) {
             Entry::Occupied(mut o) => {
@@ -123,30 +135,7 @@ impl BindGroupCache {
                 o.get().group.clone()
             }
             Entry::Vacant(v) => {
-                let key = v.key();
-                let entries = key
-                    .resources
-                    .iter()
-                    .enumerate()
-                    .map(|(i, r)| wgpu::BindGroupEntry {
-                        binding: i as u32,
-                        resource: match r {
-                            BoundResource::Buffer(buffer, offset, size) => {
-                                wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                    buffer,
-                                    offset: *offset,
-                                    size: *size,
-                                })
-                            }
-                            BoundResource::View(view) => wgpu::BindingResource::TextureView(view),
-                        },
-                    })
-                    .collect::<Vec<_>>();
-                let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout: &key.layout,
-                    entries: &entries,
-                });
+                let group = Self::create(device, v.key());
                 #[cfg(test)]
                 {
                     self.created += 1;
@@ -158,6 +147,42 @@ impl BindGroupCache {
                 group
             }
         }
+    }
+
+    fn create(device: &Device, key: &BindGroupKey) -> BindGroup {
+        let entries = key
+            .resources
+            .iter()
+            .enumerate()
+            .map(|(i, r)| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: match r {
+                    BoundResource::Buffer(buffer, offset, size) => {
+                        wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer,
+                            offset: *offset,
+                            size: *size,
+                        })
+                    }
+                    BoundResource::View(view) => wgpu::BindingResource::TextureView(view),
+                },
+            })
+            .collect::<Vec<_>>();
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &key.layout,
+            entries: &entries,
+        })
+    }
+
+    /// Drops the groups that bind `view`, whose texture is being destroyed: they could never be
+    /// used again, and would keep the texture's handle for nothing.
+    fn forget_view(&mut self, view: &TextureView) {
+        self.groups.retain(|key, _| {
+            !key.resources
+                .iter()
+                .any(|r| matches!(r, BoundResource::View(v) if v == view))
+        });
     }
 
     /// Ends a recording: drops the groups no recording has used for a while.
@@ -898,7 +923,8 @@ impl WgpuEngine {
             }
         }
         for id in free_images {
-            if let Some((texture, _view)) = self.bind_map.image_map.remove(&id) {
+            if let Some((texture, view)) = self.bind_map.image_map.remove(&id) {
+                self.bind_groups.forget_view(&view);
                 // TODO: have a pool to avoid needless re-allocation
                 texture.destroy();
             }
@@ -1305,6 +1331,13 @@ impl<'a> TransientBindMap<'a> {
                 }
             }
         }
+        // Resources the caller passed in for this render are not ours to keep alive.
+        let cacheable = !bindings.iter().any(|proxy| match proxy {
+            ResourceProxy::Buffer(proxy) | ResourceProxy::BufferRange { proxy, .. } => {
+                matches!(self.bufs.get(&proxy.id), Some(TransientBuf::Gpu(_)))
+            }
+            ResourceProxy::Image(proxy) => self.images.contains_key(&proxy.id),
+        });
         let resources = bindings
             .iter()
             .map(|proxy| match proxy {
@@ -1347,6 +1380,7 @@ impl<'a> TransientBindMap<'a> {
                 layout: layout.clone(),
                 resources,
             },
+            cacheable,
         )
     }
 
