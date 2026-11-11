@@ -9,6 +9,8 @@ use super::{
 };
 use bytemuck::{Pod, Zeroable};
 
+mod initial;
+
 const TILE_WIDTH: u32 = 16;
 const TILE_HEIGHT: u32 = 16;
 
@@ -200,11 +202,11 @@ impl RenderConfig {
     /// This config with its bump-allocated buffers at least as large as `min`.
     ///
     /// Vello's own sizes for these buffers are fixed guesses that do not grow
-    /// with the target or the scene; a large window with many layers needs
-    /// more, and a frame that runs out is dropped. A renderer passes here the
-    /// floors its target needs ([`BumpSizes::floors`]) and, once it has read
-    /// back the [`BumpAllocators`] of a frame that overflowed, what that frame
-    /// needed ([`BumpSizes::grown_for`]).
+    /// with the target or the scene. A renderer that reads no counters back
+    /// (`use_cpu`, WebAssembly), and so never sees an overflow, keeps them and
+    /// passes here the floors its target needs ([`BumpSizes::floors`]). One that
+    /// does read them back sizes the buffers exactly instead
+    /// ([`Self::with_exact_bump_sizes`]).
     #[must_use]
     pub fn with_bump_sizes(mut self, min: &BumpSizes) -> Self {
         let sizes = &mut self.buffer_sizes;
@@ -221,9 +223,39 @@ impl RenderConfig {
         sizes.segments = BufferSize::new(sizes.segments.len().max(min.segments));
         sizes.blend_spill = BufferSize::new(sizes.blend_spill.len().max(min.blend));
         sizes.ptcl = BufferSize::new(sizes.ptcl.len().max(min.ptcl));
+        self.sync_bump_sizes()
+    }
+}
+
+impl RenderConfig {
+    /// This config with its bump-allocated buffers at exactly `sizes`, Vello's
+    /// own sizes for them set aside.
+    ///
+    /// For a renderer that reads every frame's counters back and grows what a
+    /// frame ran out of: it starts from [`BumpSizes::initial`], which follows
+    /// the target and the scene, and keeps the largest sizes any frame has had
+    /// or needed. Without that readback (`use_cpu`, WebAssembly) an overflow
+    /// would go unseen, and [`Self::with_bump_sizes`] keeps Vello's sizes.
+    #[must_use]
+    pub fn with_exact_bump_sizes(mut self, sizes: &BumpSizes) -> Self {
+        let buffers = &mut self.buffer_sizes;
+        let bin_data_start = self.gpu.layout.bin_data_start;
+        buffers.lines = BufferSize::new(sizes.lines);
+        buffers.bin_data = BufferSize::new(bin_data_start.saturating_add(sizes.binning));
+        buffers.tiles = BufferSize::new(sizes.tiles);
+        buffers.seg_counts = BufferSize::new(sizes.seg_counts);
+        buffers.segments = BufferSize::new(sizes.segments);
+        buffers.blend_spill = BufferSize::new(sizes.blend);
+        buffers.ptcl = BufferSize::new(sizes.ptcl);
+        self.sync_bump_sizes()
+    }
+
+    /// The GPU config's bump sizes from the buffer sizes.
+    fn sync_bump_sizes(mut self) -> Self {
+        let sizes = &self.buffer_sizes;
         let gpu = &mut self.gpu;
         gpu.lines_size = sizes.lines.len();
-        gpu.binning_size = sizes.bin_data.len() - bin_data_start;
+        gpu.binning_size = sizes.bin_data.len() - gpu.layout.bin_data_start;
         gpu.tiles_size = sizes.tiles.len();
         gpu.seg_counts_size = sizes.seg_counts.len();
         gpu.segments_size = sizes.segments.len();
@@ -278,6 +310,13 @@ const TILES_PER_TARGET_TILE: u32 = 32;
 /// full-window opacity layers, a plausible page, overflow 256 at 4K, and a new
 /// renderer would pay that again each time. It changes nothing up to 1440p.
 const PTCL_WORDS_PER_TARGET_TILE: u32 = 512;
+
+/// Segments a grown buffer of lines is followed by, per line, when flattening
+/// ran out and the stages after it said nothing (`BumpSizes::grown_for`). In
+/// rinch #2466's calibration, frames of more than a few thousand lines used at
+/// most 4.6 a line (rinch's component showcase at 4K); smaller ones used more,
+/// which the initial sizes' floors already hold.
+const GROWN_SEGMENTS_PER_LINE: u32 = 8;
 
 /// What the shaders' `PTCL_INITIAL_ALLOC` reserves per tile before the
 /// dynamic part of the command list (`shader/shared/ptcl.wgsl`).
@@ -380,19 +419,28 @@ impl BumpSizes {
             .max(had.binning);
         let f = bump.failed;
         let coarse = f & STAGE_COARSE != 0;
+        let lines = grow(
+            had.lines,
+            bump.lines,
+            f & STAGE_FLATTEN != 0,
+            size_of::<LineSoup>(),
+        );
+        // The stages after a failed one stop short of saying what they need,
+        // so a frame that ran out of lines would go on to run out of segments
+        // on its next try. Those follow the lines it asked for instead.
+        let after_flatten = if f & STAGE_FLATTEN != 0 {
+            lines.saturating_mul(GROWN_SEGMENTS_PER_LINE)
+        } else {
+            0
+        };
         let seg_counts = grow(
             had.seg_counts,
-            bump.seg_counts,
+            bump.seg_counts.max(after_flatten),
             f & STAGE_PATH_COUNT != 0,
             size_of::<SegmentCount>(),
         );
         Self {
-            lines: grow(
-                had.lines,
-                bump.lines,
-                f & STAGE_FLATTEN != 0,
-                size_of::<LineSoup>(),
-            ),
+            lines,
             binning: grow(
                 had.binning,
                 bump.binning,
@@ -679,6 +727,62 @@ mod bump_sizes_tests {
 
     fn config(w: u32, h: u32) -> ConfigUniform {
         RenderConfig::new(&Layout::default(), w, h, &peniko::Color::WHITE).gpu
+    }
+
+    /// A config whose bump buffers are sized as a renderer that reads its
+    /// counters back sizes them, for an empty scene.
+    fn exact_config(w: u32, h: u32) -> ConfigUniform {
+        let layout = Layout::default();
+        let sizes = BumpSizes::initial(&layout, w, h, u64::MAX);
+        RenderConfig::new(&layout, w, h, &peniko::Color::WHITE)
+            .with_exact_bump_sizes(&sizes)
+            .gpu
+    }
+
+    #[test]
+    fn exact_sizes_set_vello_s_aside_and_at_least_keeps_them() {
+        let small = exact_config(1280, 40);
+        let initial = BumpSizes::initial(&Layout::default(), 1280, 40, u64::MAX);
+        assert_eq!(BumpSizes::of(&small), initial);
+        assert!(small.lines_size < 1 << 21 && small.ptcl_size < 1 << 23);
+        // The path without readback keeps Vello's sizes as its least.
+        let kept = RenderConfig::new(&Layout::default(), 1280, 40, &peniko::Color::WHITE)
+            .with_bump_sizes(&initial)
+            .gpu;
+        assert_eq!(kept.lines_size, 1 << 21);
+        assert_eq!(kept.ptcl_size, 1 << 23);
+    }
+
+    #[test]
+    fn a_frame_that_ran_out_of_lines_grows_the_segments_after_it() {
+        let g = exact_config(1920, 1080);
+        let had = BumpSizes::of(&g);
+        // Flattening failed; path_count and path_tiling stopped short.
+        let bump = BumpAllocators {
+            failed: STAGE_FLATTEN,
+            lines: 400_000,
+            seg_counts: 10,
+            segments: 10,
+            ..Default::default()
+        };
+        let grown = BumpSizes::grown_for(&g, &bump, u64::MAX);
+        assert_eq!(grown.lines, 500_000);
+        // Eight segments a grown line, with the quarter every growth adds.
+        assert_eq!(grown.seg_counts, 8 * 500_000 + 8 * 500_000 / 4);
+        assert!(grown.segments >= grown.seg_counts);
+        assert_eq!(grown.tiles, had.tiles, "tiles do not follow lines");
+        assert_eq!(grown.ptcl, had.ptcl);
+        // Without a flatten failure the segments only follow what they asked.
+        let bump = BumpAllocators {
+            failed: STAGE_PATH_COUNT,
+            lines: 1000,
+            seg_counts: had.seg_counts + 100,
+            ..Default::default()
+        };
+        let grown = BumpSizes::grown_for(&g, &bump, u64::MAX);
+        assert_eq!(grown.lines, had.lines);
+        let wanted = had.seg_counts + 100;
+        assert_eq!(grown.seg_counts, wanted + wanted / 4);
     }
 
     #[test]

@@ -16,11 +16,39 @@ enum AtlasProxyAction {
     Resized,
 }
 
+const TILE_BUF: &str = "vello.tile_buf";
+const SEGMENTS_BUF: &str = "vello.segments_buf";
+const PTCL_BUF: &str = "vello.ptcl_buf";
+const LINES_BUF: &str = "vello.lines_buf";
+const SEG_COUNTS_BUF: &str = "vello.seg_counts_buf";
+const BLEND_SPILL_BUF: &str = "vello.blend_spill";
+
+/// The bump buffers whose size only ever grows for a renderer: each is
+/// exactly its [`BumpSizes`](vello_encoding::BumpSizes) entry, which is a
+/// high-water mark. So once one is created at a new size, the engine's pool
+/// drops the smaller ones of that label, which no frame asks for again.
+/// (`bin_data` is not one: its size adds the scene's binning info.)
+pub(crate) const GROWING_BUFFERS: [&str; 6] = [
+    TILE_BUF,
+    SEGMENTS_BUF,
+    PTCL_BUF,
+    LINES_BUF,
+    SEG_COUNTS_BUF,
+    BLEND_SPILL_BUF,
+];
+
 /// State for a render in progress.
 pub struct Render {
     /// The least the bump-allocated buffers are given (a renderer grows it
     /// after a frame overflowed them); `None` is Vello's own sizes.
     pub(crate) bump_sizes: Option<vello_encoding::BumpSizes>,
+    /// `Some` when the frame's counters are read back: the buffers are then
+    /// sized from the target and the scene ([`BumpSizes::initial`], at least
+    /// `bump_sizes`), and no larger than this, the device's largest storage
+    /// binding. `None` keeps Vello's sizes, raised to `bump_sizes`.
+    ///
+    /// [`BumpSizes::initial`]: vello_encoding::BumpSizes::initial
+    pub(crate) bump_limit: Option<u64>,
     /// The GPU config the coarse recording was made with, so the bump
     /// counters read back after it can be judged against its sizes.
     pub(crate) gpu_config: Option<vello_encoding::ConfigUniform>,
@@ -93,6 +121,7 @@ impl Render {
     pub fn new() -> Self {
         Self {
             bump_sizes: None,
+            bump_limit: None,
             gpu_config: None,
             fine_wg_count: None,
             fine_resources: None,
@@ -177,9 +206,19 @@ impl Render {
         }
         let cpu_config =
             RenderConfig::new(&layout, params.width, params.height, &params.base_color);
-        let cpu_config = match &self.bump_sizes {
-            Some(min) => cpu_config.with_bump_sizes(min),
-            None => cpu_config,
+        let cpu_config = match (self.bump_limit, self.bump_sizes) {
+            (Some(max_bytes), min) => {
+                let sizes = vello_encoding::BumpSizes::initial(
+                    &layout,
+                    params.width,
+                    params.height,
+                    max_bytes,
+                )
+                .at_least(min.unwrap_or_default());
+                cpu_config.with_exact_bump_sizes(&sizes)
+            }
+            (None, Some(min)) => cpu_config.with_bump_sizes(&min),
+            (None, None) => cpu_config,
         };
         self.gpu_config = Some(cpu_config.gpu);
         // HACK: The coarse workgroup counts is the number of active bins.
@@ -213,14 +252,10 @@ impl Render {
             buffer_sizes.bin_data.size_in_bytes() as u64,
             "vello.info_bin_data_buf",
         );
-        let tile_buf =
-            ResourceProxy::new_buf(buffer_sizes.tiles.size_in_bytes().into(), "vello.tile_buf");
-        let segments_buf = ResourceProxy::new_buf(
-            buffer_sizes.segments.size_in_bytes().into(),
-            "vello.segments_buf",
-        );
-        let ptcl_buf =
-            ResourceProxy::new_buf(buffer_sizes.ptcl.size_in_bytes().into(), "vello.ptcl_buf");
+        let tile_buf = ResourceProxy::new_buf(buffer_sizes.tiles.size_in_bytes().into(), TILE_BUF);
+        let segments_buf =
+            ResourceProxy::new_buf(buffer_sizes.segments.size_in_bytes().into(), SEGMENTS_BUF);
+        let ptcl_buf = ResourceProxy::new_buf(buffer_sizes.ptcl.size_in_bytes().into(), PTCL_BUF);
         let reduced_buf = ResourceProxy::new_buf(
             buffer_sizes.path_reduced.size_in_bytes().into(),
             "vello.reduced_buf",
@@ -292,7 +327,7 @@ impl Render {
         recording.clear_all(bump_buf);
         let bump_buf = ResourceProxy::Buffer(bump_buf);
         let lines_buf =
-            ResourceProxy::new_buf(buffer_sizes.lines.size_in_bytes().into(), "vello.lines_buf");
+            ResourceProxy::new_buf(buffer_sizes.lines.size_in_bytes().into(), LINES_BUF);
         recording.dispatch(
             shaders.flatten,
             wg_counts.flatten,
@@ -426,7 +461,7 @@ impl Render {
         );
         let seg_counts_buf = ResourceProxy::new_buf(
             buffer_sizes.seg_counts.size_in_bytes().into(),
-            "vello.seg_counts_buf",
+            SEG_COUNTS_BUF,
         );
         recording.dispatch_indirect(
             shaders.path_count,
@@ -488,7 +523,7 @@ impl Render {
         let out_image = ImageProxy::new(params.width, params.height, ImageFormat::Rgba8);
         let blend_spill_buf = BufferProxy::new(
             buffer_sizes.blend_spill.size_in_bytes().into(),
-            "vello.blend_spill",
+            BLEND_SPILL_BUF,
         );
         self.fine_wg_count = Some(wg_counts.fine);
         self.fine_resources = Some(FineResources {
