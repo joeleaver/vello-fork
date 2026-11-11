@@ -977,6 +977,12 @@ impl BindMap {
 
 const SIZE_CLASS_BITS: u32 = 1;
 
+/// Whether a new buffer `new` makes the pooled `kept` dead: the same label and
+/// usage at a smaller size.
+fn supersedes(new: &BufferProperties, kept: &BufferProperties) -> bool {
+    kept.name == new.name && kept.usages == new.usages && kept.size < new.size
+}
+
 impl ResourcePool {
     /// Get a buffer from the pool or create one.
     fn get_buf(
@@ -996,6 +1002,11 @@ impl ResourcePool {
             && let Some(buf) = buf_vec.pop()
         {
             return buf;
+        }
+        // A buffer that only grows (`GROWING_BUFFERS`) is never asked for at
+        // its old sizes again: release those.
+        if crate::render::GROWING_BUFFERS.contains(&name) {
+            self.bufs.retain(|kept, _| !supersedes(&props, kept));
         }
         device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(name),
@@ -1249,5 +1260,56 @@ impl<'a> TransientBindMap<'a> {
                 ResourceProxy::Image(_) => todo!(),
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    fn props(size: u64, name: &'static str) -> BufferProperties {
+        BufferProperties {
+            size,
+            usages: BufferUsages::STORAGE,
+            name,
+        }
+    }
+
+    #[test]
+    fn a_grown_buffer_supersedes_only_its_own_smaller_sizes() {
+        let new = props(4 << 20, "vello.ptcl_buf");
+        assert!(supersedes(&new, &props(2 << 20, "vello.ptcl_buf")));
+        assert!(
+            !supersedes(&new, &props(4 << 20, "vello.ptcl_buf")),
+            "same size"
+        );
+        assert!(
+            !supersedes(&new, &props(8 << 20, "vello.ptcl_buf")),
+            "larger"
+        );
+        assert!(
+            !supersedes(&new, &props(2 << 20, "vello.lines_buf")),
+            "other label"
+        );
+        let other_usage = BufferProperties {
+            usages: BufferUsages::COPY_SRC,
+            ..props(2 << 20, "vello.ptcl_buf")
+        };
+        assert!(!supersedes(&new, &other_usage), "other usage");
+    }
+
+    #[test]
+    fn the_growing_buffers_are_the_bump_buffers_sized_by_high_water() {
+        assert_eq!(
+            crate::render::GROWING_BUFFERS,
+            [
+                "vello.tile_buf",
+                "vello.segments_buf",
+                "vello.ptcl_buf",
+                "vello.lines_buf",
+                "vello.seg_counts_buf",
+                "vello.blend_spill",
+            ]
+        );
     }
 }

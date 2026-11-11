@@ -331,8 +331,8 @@ pub struct Renderer {
     resolver: Resolver,
     image_atlas: Option<recording::ImageProxy>,
     shaders: FullShaders,
-    /// The least the bump-allocated buffers get: the floors of the largest
-    /// target so far, grown whenever a frame ran out of one (see
+    /// The least the bump-allocated buffers get: the largest sizes any frame
+    /// so far was given, grown whenever a frame ran out of one (see
     /// [`Renderer::render_to_texture`]). It never shrinks.
     bump_sizes: vello_encoding::BumpSizes,
     /// The counters of frames submitted and not yet read, oldest first, at
@@ -545,10 +545,14 @@ impl Renderer {
     ///
     /// A frame whose GPU stages run out of one of their bump-allocated buffers
     /// (many clip layers, a dense scene) is not drawn. Those buffers start at
-    /// Vello's sizes or at floors that follow the target, whichever is larger,
-    /// so an ordinary frame fits. So that one that does not is not silent,
-    /// except with [`RendererOptions::use_cpu`] and on WebAssembly each frame's
-    /// allocation counters are read back; they arrive after the GPU has
+    /// sizes that follow the target and the scene
+    /// ([`BumpSizes::initial`](vello_encoding::BumpSizes::initial)), calibrated
+    /// so that an ordinary frame fits with a margin, and never get smaller than
+    /// what an earlier frame was given. (With [`RendererOptions::use_cpu`] and
+    /// on WebAssembly, where no counters come back, they keep Vello's fixed
+    /// sizes, raised to floors that follow the target.) So that one that does
+    /// not fit is not silent, except with [`RendererOptions::use_cpu`] and on
+    /// WebAssembly each frame's allocation counters are read back; they arrive after the GPU has
     /// finished it, and this and [`Self::check_frames`] collect them without
     /// blocking. A frame that overflowed has the buffers it ran out of grown to
     /// what it asked for, and the grown sizes are kept for every later frame.
@@ -571,12 +575,20 @@ impl Renderer {
         let robust = !self.options.use_cpu && !cfg!(target_arch = "wasm32");
         let max_bytes = max_bump_bytes(device);
         self.collect_bump_readbacks(device, max_bytes);
-        self.bump_sizes = self.bump_sizes.at_least(vello_encoding::BumpSizes::floors(
-            params.width,
-            params.height,
-            max_bytes,
-        ));
         let mut render = Render::new();
+        if robust {
+            // Sized from the target and the scene; an overflow is found from
+            // the counters and grown from.
+            render.bump_limit = Some(max_bytes);
+        } else {
+            // No counters come back, so an overflow would go unseen: Vello's
+            // sizes, raised to floors that follow the target.
+            self.bump_sizes = self.bump_sizes.at_least(vello_encoding::BumpSizes::floors(
+                params.width,
+                params.height,
+                max_bytes,
+            ));
+        }
         render.bump_sizes = Some(self.bump_sizes);
         let mut recording = render.render_encoding_coarse(
             scene.encoding(),
@@ -589,6 +601,11 @@ impl Renderer {
         let target = render.out_image();
         let bump_buf = render.bump_buf();
         let gpu_config = render.gpu_config.expect("set by the coarse recording");
+        // The sizes this frame was given are the least every later one gets:
+        // a partial frame, a slice and a full frame of one window share them.
+        self.bump_sizes = self
+            .bump_sizes
+            .at_least(vello_encoding::BumpSizes::of(&gpu_config));
         render.record_fine(&self.shaders, &mut recording);
         let external_resources = [ExternalResource::Image(target, texture)];
         let submitted = self.engine.run_recording(
@@ -700,7 +717,16 @@ impl Renderer {
             let config = &readback.config;
             let (width, height) = (config.target_width, config.target_height);
             let had = vello_encoding::BumpSizes::of(config);
-            log::debug!("vello: a {width}x{height} frame used {bump:?} of {had:?}");
+            // What the initial sizes are derived from, beside what the frame
+            // used: the counts a recalibration of `BumpSizes::initial` reads.
+            let layout = &config.layout;
+            log::debug!(
+                "vello: a {width}x{height} frame of {} path tags, {} paths, {} draw objects and {} clips used {bump:?} of {had:?}",
+                layout.path_tags_size(),
+                layout.n_paths,
+                layout.n_draw_objects,
+                layout.n_clips
+            );
             if bump.failed == 0 {
                 continue;
             }
