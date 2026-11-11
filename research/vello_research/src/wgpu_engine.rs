@@ -272,6 +272,8 @@ struct BufferProperties {
 #[derive(Default)]
 struct ResourcePool {
     bufs: HashMap<BufferProperties, Vec<Buffer>>,
+    /// Whether `get_buf` let superseded buffers go since the bind-group cache last looked.
+    released: bool,
 }
 
 /// The transient bind map contains short-lifetime resources.
@@ -909,6 +911,11 @@ impl WgpuEngine {
         #[cfg(feature = "wgpu-profiler")]
         profiler.resolve_queries(&mut encoder);
         queue.submit(Some(encoder.finish()));
+        // A cached group would keep a buffer the pool let go alive: start the cache afresh when
+        // that happens (once per new high-water mark of a growing buffer).
+        if std::mem::take(&mut self.pool.released) {
+            self.bind_groups.groups.clear();
+        }
         self.bind_groups.end_recording();
         for id in free_bufs {
             if let Some(buf) = self.bind_map.buf_map.remove(&id)
@@ -1162,7 +1169,9 @@ impl ResourcePool {
         // A buffer that only grows (`GROWING_BUFFERS`) is never asked for at
         // its old sizes again: release those.
         if crate::render::GROWING_BUFFERS.contains(&name) {
+            let before = self.bufs.len();
             self.bufs.retain(|kept, _| !supersedes(&props, kept));
+            self.released |= self.bufs.len() != before;
         }
         device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(name),
