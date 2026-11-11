@@ -65,3 +65,6 @@ thiserror = { workspace = true }
 png = { workspace = true }
 naga = { workspace = true, features = ["deserialize"], optional = true }
 postcard = { workspace = true, optional = true }
+
+[dev-dependencies]
+pollster = { workspace = true }

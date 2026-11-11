@@ -1039,3 +1039,102 @@ impl<'a> DebugDownloads<'a> {
         Ok(Self { lines })
     }
 }
+
+/// The bind-group cache (rinch #2469). Needs a GPU adapter:
+/// `cargo test -p vello -- --ignored bind_group`.
+#[cfg(all(test, feature = "wgpu", not(target_arch = "wasm32")))]
+mod bind_group_cache_tests {
+    use super::*;
+    use peniko::kurbo::{Affine, Rect, RoundedRect};
+    use peniko::{Color, Fill};
+
+    fn gpu() -> (Device, Queue) {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default()))
+            .expect("these tests need a GPU adapter");
+        pollster::block_on(adapter.request_device(&Default::default())).expect("device")
+    }
+
+    fn scene(dx: f64) -> Scene {
+        let mut s = Scene::new();
+        s.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            Color::from_rgba8(40, 40, 50, 255),
+            None,
+            &Rect::new(0.0, 0.0, 256.0, 64.0),
+        );
+        s.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            Color::from_rgba8(200, 200, 210, 255),
+            None,
+            &RoundedRect::new(8.0 + dx, 8.0, 120.0 + dx, 40.0, 6.0),
+        );
+        s
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter"]
+    fn a_repeated_frame_makes_only_the_bind_groups_of_its_new_resources() {
+        let (device, queue) = gpu();
+        let mut renderer = Renderer::new(
+            &device,
+            RendererOptions {
+                use_cpu: false,
+                antialiasing_support: AaSupport::area_only(),
+                num_init_threads: NonZeroUsize::new(1),
+                pipeline_cache: None,
+            },
+        )
+        .unwrap();
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: 256,
+                height: 64,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        let params = RenderParams {
+            base_color: Color::BLACK,
+            width: 256,
+            height: 64,
+            antialiasing_method: AaConfig::Area,
+        };
+        let mut render = |r: &mut Renderer, dx: f64| {
+            r.render_to_texture(&device, &queue, &scene(dx), &view, &params)
+                .unwrap();
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            assert_eq!(r.check_frames(&device), FrameCheck::Settled);
+            r.engine.bind_groups.created
+        };
+        // Two frames to settle the pool's buffers, then a different scene of the same shape.
+        render(&mut renderer, 0.0);
+        let settled = render(&mut renderer, 1.0);
+        let next = render(&mut renderer, 2.0);
+        let dispatches = renderer.engine.bind_groups.groups.len() as u64;
+        // Only the dispatches that bind a texture made for the frame (the gradient ramps, which
+        // Vello uploads each frame) need a new group; every other one is reused.
+        assert!(
+            next - settled <= 2,
+            "a repeated frame made {} bind groups ({} cached)",
+            next - settled,
+            dispatches
+        );
+        assert!(dispatches >= 8, "only {dispatches} bind groups cached");
+
+        // Groups not used for KEEP_RECORDINGS recordings are dropped.
+        for _ in 0..wgpu_engine::KEEP_BIND_GROUPS_FOR_RECORDINGS {
+            renderer.engine.bind_groups.end_recording();
+        }
+        assert_eq!(renderer.engine.bind_groups.groups.len(), 0);
+    }
+}
