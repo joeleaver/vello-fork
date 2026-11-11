@@ -978,15 +978,29 @@ fn extend_mode(t: f32, mode: u32, max: f32) -> f32 {
 // Fork (rinch #1661, #1755): the texel a bilinear tap at integer texel index `i` reads
 // along an axis of `n` texels: clamped (pad), wrapped (repeat) or mirrored (reflect, the
 // texel sequence 0..n-1, n-1..0). Always within [0, n - 1].
+// `i` modulo `n` for integer-valued `i` and `n`, in [0, n - 1]. `i / n` may be computed
+// approximately (RADV: 15.0 / 15.0 came out below 1.0, so texel 15 of a 15-texel image
+// "wrapped" to 15 and was clamped to 14), so the result is corrected by one period.
+fn wrap_texel(i: f32, n: f32) -> f32 {
+    var m = i - n * floor(i / n);
+    if m >= n {
+        m -= n;
+    }
+    if m < 0.0 {
+        m += n;
+    }
+    return m;
+}
+
 fn extend_texel(i: f32, mode: u32, n: f32) -> f32 {
     var t: f32;
     switch mode {
         case EXTEND_REPEAT: {
-            t = i - n * floor(i / n);
+            t = wrap_texel(i, n);
         }
         case EXTEND_REFLECT: {
             let p = 2.0 * n;
-            let m = i - p * floor(i / p);
+            let m = wrap_texel(i, p);
             t = select(m, p - 1.0 - m, m >= n);
         }
         case EXTEND_PAD, default: {
