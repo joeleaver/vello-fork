@@ -21,8 +21,9 @@ use vello_encoding::{BumpAllocators, BumpSizes, ConfigUniform};
 #[non_exhaustive]
 pub struct BumpReport {
     /// The counters the GPU wrote: how many elements each buffer was asked
-    /// for, and in `failed` the stages that ran out.
-    pub needed: BumpAllocators,
+    /// for, and in `failed` the stages that ran out. [`Self::needed`] says it
+    /// per buffer.
+    pub counters: BumpAllocators,
     /// The sizes the frame was given.
     pub given: BumpSizes,
     /// The frame's configuration: its target size (`target_width`,
@@ -35,6 +36,15 @@ pub struct BumpReport {
 }
 
 /// The reports kept, newest last, at most `capacity`; none at capacity 0.
+impl BumpReport {
+    /// What the frame asked of each buffer, in elements, comparable with
+    /// [`Self::given`] and with [`BumpSizes::initial`]
+    /// ([`BumpSizes::needed`]).
+    pub fn needed(&self) -> BumpSizes {
+        BumpSizes::needed(&self.config, &self.counters)
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct Recorder {
     capacity: usize,
@@ -56,7 +66,7 @@ impl Recorder {
 
     /// Keep a report of a frame whose counters came back, if recording; the
     /// oldest goes when full.
-    pub(crate) fn record(&mut self, needed: &BumpAllocators, config: &ConfigUniform, clips: u32) {
+    pub(crate) fn record(&mut self, counters: &BumpAllocators, config: &ConfigUniform, clips: u32) {
         if self.capacity == 0 {
             return;
         }
@@ -64,7 +74,7 @@ impl Recorder {
             self.reports.pop_front();
         }
         self.reports.push_back(BumpReport {
-            needed: *needed,
+            counters: *counters,
             given: BumpSizes::of(config),
             config: *config,
             max_open_clips: clips,
@@ -89,7 +99,7 @@ mod tests {
     }
 
     fn lines(reports: &[BumpReport]) -> Vec<u32> {
-        reports.iter().map(|r| r.needed.lines).collect()
+        reports.iter().map(|r| r.counters.lines).collect()
     }
 
     #[test]
@@ -116,6 +126,7 @@ mod tests {
         assert_eq!(reports[0].given, BumpSizes::of(&config));
         assert_eq!(reports[0].config.target_width, 64);
         assert_eq!(reports[0].max_open_clips, 5);
+        assert_eq!(reports[0].needed().lines, 2);
         assert!(recorder.take().is_empty(), "drained");
         recorder.record(&counters(4), &config, 0);
         assert_eq!(lines(&recorder.take()), [4], "and still recording");
