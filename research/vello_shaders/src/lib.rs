@@ -67,6 +67,12 @@ pub struct ComputeShader<'a> {
 
     #[cfg(feature = "msl")]
     pub msl: MslSource<'a>,
+
+    /// The naga module of [`Self::wgsl`]'s code, parsed and serialized with postcard at build
+    /// time by the build's own naga (rinch #2468). Deserializing it costs about a twentieth of
+    /// parsing the WGSL. Empty where no IR was made (`compile::ShaderInfo` at run time).
+    #[cfg(feature = "naga_ir")]
+    pub naga_ir: Cow<'a, [u8]>,
 }
 
 #[cfg(feature = "wgsl")]

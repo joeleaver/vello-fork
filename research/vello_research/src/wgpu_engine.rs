@@ -20,8 +20,38 @@ use crate::{
 use vello_shaders::cpu::CpuBinding;
 
 #[cfg(not(target_arch = "wasm32"))]
+/// A compute shader's code: its WGSL, and with the `naga_ir` feature the naga module parsed from
+/// it at build time (rinch #2468).
+pub(crate) struct ShaderCode {
+    pub(crate) wgsl: Cow<'static, str>,
+    /// Postcard bytes of the WGSL's naga module; empty where there are none (hot reload).
+    #[cfg(feature = "naga_ir")]
+    pub(crate) naga_ir: Cow<'static, [u8]>,
+}
+
+impl ShaderCode {
+    /// The source wgpu creates the module from: the build-time module where there is one and it
+    /// decodes, the WGSL otherwise. A module that does not decode was made by a different naga
+    /// than the one linked (cargo resolves one 30.x for both, so this is not expected); its WGSL
+    /// still works, at the cost of parsing it.
+    fn into_wgpu(self, label: &str) -> wgpu::ShaderSource<'static> {
+        #[cfg(feature = "naga_ir")]
+        if !self.naga_ir.is_empty() {
+            match postcard::from_bytes::<naga::Module>(&self.naga_ir) {
+                Ok(module) => return wgpu::ShaderSource::Naga(Cow::Owned(module)),
+                Err(e) => log::warn!(
+                    "{label}: the shader's build-time naga IR does not decode ({e}); parsing its WGSL"
+                ),
+            }
+        }
+        #[cfg(not(feature = "naga_ir"))]
+        let _ = label;
+        wgpu::ShaderSource::Wgsl(self.wgsl)
+    }
+}
+
 struct UninitialisedShader {
-    wgsl: Cow<'static, str>,
+    code: ShaderCode,
     label: &'static str,
     entries: Vec<wgpu::BindGroupLayoutEntry>,
     shader_id: ShaderId,
@@ -200,7 +230,7 @@ impl WgpuEngine {
                                 let shader = Self::create_compute_pipeline(
                                     device,
                                     it.label,
-                                    it.wgsl,
+                                    it.code,
                                     it.entries,
                                     pipeline_cache,
                                 );
@@ -212,7 +242,7 @@ impl WgpuEngine {
                                         let shader = Self::create_compute_pipeline(
                                             device,
                                             value.label,
-                                            value.wgsl,
+                                            value.code,
                                             value.entries,
                                             pipeline_cache,
                                         );
@@ -249,7 +279,7 @@ impl WgpuEngine {
         &mut self,
         device: &Device,
         label: &'static str,
-        wgsl: Cow<'static, str>,
+        code: ShaderCode,
         layout: &[BindType],
         cpu_shader: CpuShaderType,
     ) -> ShaderId {
@@ -292,7 +322,7 @@ impl WgpuEngine {
                 cpu: None,
             });
             uninit.push(UninitialisedShader {
-                wgsl,
+                code,
                 label,
                 entries,
                 shader_id: id,
@@ -302,7 +332,7 @@ impl WgpuEngine {
         let wgpu = Self::create_compute_pipeline(
             device,
             label,
-            wgsl,
+            code,
             entries,
             self.pipeline_cache.as_ref(),
         );
@@ -845,7 +875,7 @@ impl WgpuEngine {
     fn create_compute_pipeline(
         device: &Device,
         label: &str,
-        wgsl: Cow<'_, str>,
+        code: ShaderCode,
         entries: Vec<wgpu::BindGroupLayoutEntry>,
         cache: Option<&PipelineCache>,
     ) -> WgpuShader {
@@ -854,7 +884,7 @@ impl WgpuEngine {
             device.create_shader_module_trusted(
                 wgpu::ShaderModuleDescriptor {
                     label: Some(label),
-                    source: wgpu::ShaderSource::Wgsl(wgsl),
+                    source: code.into_wgpu(label),
                 },
                 wgpu::ShaderRuntimeChecks::unchecked(),
             )

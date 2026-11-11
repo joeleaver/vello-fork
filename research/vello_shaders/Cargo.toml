@@ -19,6 +19,11 @@ targets = []
 default = ["wgsl", "cpu"]
 compile = ["dep:naga", "dep:thiserror", "dep:log"]
 
+# Embed each shader's naga module, parsed and serialized (postcard) at build time, beside its
+# WGSL: `ComputeShader::naga_ir`. A renderer hands it to wgpu as `ShaderSource::Naga` and skips
+# parsing the WGSL, about 80% of the CPU `Renderer::new` spends on a warm driver cache (rinch #2468).
+naga_ir = ["wgsl", "dep:postcard"]
+
 # Target shading language variants of the vello shaders to link into the library.
 wgsl = []
 msl = ["naga?/msl-out"]
@@ -37,6 +42,11 @@ vello_encoding = { workspace = true, optional = true }
 log = { workspace = true, optional = true }
 
 [build-dependencies]
-naga = { workspace = true, features = ["wgsl-in"] }
+naga = { workspace = true, features = ["wgsl-in", "serialize"] }
+postcard = { workspace = true, optional = true }
 thiserror = { workspace = true }
 log = { workspace = true }
+
+[dev-dependencies]
+naga = { workspace = true, features = ["wgsl-in", "serialize", "deserialize"] }
+postcard = { workspace = true }

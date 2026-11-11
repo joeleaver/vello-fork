@@ -27,6 +27,11 @@ wgpu = ["dep:wgpu", "dep:vello_shaders", "dep:futures-intrusive"]
 # please disable this crate's default features, enable its "wgpu" feature, then depend on wgpu directly
 # with the features which you need enabled.
 wgpu_default = ["wgpu", "wgpu/default"]
+# Create the shaders from naga IR made at build time (`vello_shaders/naga_ir`) rather than by
+# parsing their WGSL at every `Renderer::new`: about 80% of its CPU time on a warm driver shader
+# cache (rinch #2468). wgpu still validates each module and translates it for the backend. A
+# module that does not decode falls back to its WGSL, with a warning.
+naga_ir = ["wgpu", "vello_shaders/naga_ir", "wgpu/naga-ir", "dep:naga", "dep:postcard"]
 
 # Development only features
 
@@ -58,3 +63,5 @@ wgpu-profiler = { workspace = true, optional = true }
 thiserror = { workspace = true }
 # TODO: Add feature for built-in bitmap emoji support?
 png = { workspace = true }
+naga = { workspace = true, features = ["deserialize"], optional = true }
+postcard = { workspace = true, optional = true }

@@ -50,7 +50,10 @@ pub(crate) fn full_shaders(
     engine: &mut WgpuEngine,
     options: &RendererOptions,
 ) -> Result<FullShaders, Error> {
-    use crate::wgpu_engine::CpuShaderType;
+    #[cfg(all(feature = "hot_reload", feature = "naga_ir"))]
+    use std::borrow::Cow;
+
+    use crate::wgpu_engine::{CpuShaderType, ShaderCode};
     use BindType::*;
 
     let mut force_gpu = false;
@@ -70,13 +73,21 @@ pub(crate) fn full_shaders(
                 force_gpu = true;
             }
             #[cfg(feature = "hot_reload")]
-            let source = shaders
-                .remove(stringify!($name))
-                .expect(stringify!($name))
-                .source
-                .into();
+            let source = ShaderCode {
+                wgsl: shaders
+                    .remove(stringify!($name))
+                    .expect(stringify!($name))
+                    .source
+                    .into(),
+                #[cfg(feature = "naga_ir")]
+                naga_ir: Cow::Borrowed(&[]),
+            };
             #[cfg(not(feature = "hot_reload"))]
-            let source = shaders.$name.wgsl.code;
+            let source = ShaderCode {
+                wgsl: shaders.$name.wgsl.code,
+                #[cfg(feature = "naga_ir")]
+                naga_ir: shaders.$name.naga_ir,
+            };
             engine.add_compute_shader(
                 device,
                 concat!("vello.", $label),

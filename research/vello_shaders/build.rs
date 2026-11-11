@@ -52,6 +52,16 @@ fn write_types(buf: &mut String, shaders: &[(String, ShaderInfo)]) -> Result<(),
         writeln!(buf, "    pub {name}: ComputeShader<'a>,")?;
     }
     writeln!(buf, "}}")?;
+    writeln!(buf, "impl<'a> Shaders<'a> {{")?;
+    writeln!(buf, "    /// Every shader, in name order.")?;
+    writeln!(buf, "    pub fn all(&self) -> [&ComputeShader<'a>; {}] {{", shaders.len())?;
+    write!(buf, "        [")?;
+    for (name, _) in shaders {
+        write!(buf, "&self.{name}, ")?;
+    }
+    writeln!(buf, "]")?;
+    writeln!(buf, "    }}")?;
+    writeln!(buf, "}}")?;
     Ok(())
 }
 
@@ -100,11 +110,32 @@ fn write_shaders(buf: &mut String, shaders: &[(String, ShaderInfo)]) -> Result<(
         if cfg!(feature = "msl") {
             write_msl(buf, info)?;
         }
+        write_naga_ir(buf, name, info)?;
         writeln!(buf, "        }},")?;
     }
     writeln!(buf, "    }};")?;
     writeln!(buf, "}}")?;
     Ok(())
+}
+
+#[cfg(not(feature = "naga_ir"))]
+fn write_naga_ir(_: &mut String, _: &str, _: &ShaderInfo) -> Result<(), fmt::Error> {
+    Ok(())
+}
+
+/// Serialize the shader's parsed module into `OUT_DIR/naga_ir/{name}.postcard` and point
+/// `naga_ir` at it (rinch #2468).
+#[cfg(feature = "naga_ir")]
+fn write_naga_ir(buf: &mut String, name: &str, info: &ShaderInfo) -> Result<(), fmt::Error> {
+    let dir = Path::new(&env::var_os("OUT_DIR").unwrap()).join("naga_ir");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{name}.postcard"));
+    std::fs::write(&path, postcard::to_allocvec(&info.module).unwrap()).unwrap();
+    writeln!(
+        buf,
+        "            naga_ir: Cow::Borrowed(include_bytes!({:?})),",
+        path.display().to_string()
+    )
 }
 
 #[cfg(not(feature = "msl"))]
