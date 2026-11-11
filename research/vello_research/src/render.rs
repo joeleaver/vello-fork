@@ -28,6 +28,7 @@ const BLEND_SPILL_BUF: &str = "vello.blend_spill";
 /// high-water mark. So once one is created at a new size, the engine's pool
 /// drops the smaller ones of that label, which no frame asks for again.
 /// (`bin_data` is not one: its size adds the scene's binning info.)
+#[cfg(feature = "wgpu")]
 pub(crate) const GROWING_BUFFERS: [&str; 6] = [
     TILE_BUF,
     SEGMENTS_BUF,
