@@ -108,6 +108,11 @@
     reason = "Deferred, only apply in some feature sets so not expect"
 )]
 
+// A dev-dependency used only by the bind-group cache's GPU tests, which need
+// `wgpu` off WebAssembly: suppress `unused_crate_dependencies` elsewhere.
+#[cfg(all(test, not(all(feature = "wgpu", not(target_arch = "wasm32")))))]
+use pollster as _;
+
 mod debug;
 mod recording;
 mod render;
