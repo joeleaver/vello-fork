@@ -381,6 +381,27 @@ impl BumpSizes {
         }
     }
 
+    /// What a frame with `g`'s sizes, whose counters came back as `bump`,
+    /// asked of each buffer, in elements: the counters, with the per-tile
+    /// command list's static part (`PTCL_INITIAL_ALLOC` words a tile) added to
+    /// its dynamic one. The counter of a stage after one that failed can stop
+    /// short of what it would have asked.
+    pub fn needed(g: &ConfigUniform, bump: &BumpAllocators) -> Self {
+        let ptcl_static = g
+            .width_in_tiles
+            .saturating_mul(g.height_in_tiles)
+            .saturating_mul(PTCL_INITIAL_ALLOC);
+        Self {
+            lines: bump.lines,
+            binning: bump.binning,
+            tiles: bump.tile,
+            seg_counts: bump.seg_counts,
+            segments: bump.segments,
+            blend: bump.blend,
+            ptcl: ptcl_static.saturating_add(bump.ptcl),
+        }
+    }
+
     /// Sizes for another try at a frame recorded with config `g` whose
     /// counters came back as `bump`: every buffer the frame overflowed made
     /// large enough for what it asked of it, with a quarter more to spare.
@@ -394,10 +415,7 @@ impl BumpSizes {
         if bump.failed == 0 {
             return had;
         }
-        let ptcl_static = g
-            .width_in_tiles
-            .saturating_mul(g.height_in_tiles)
-            .saturating_mul(PTCL_INITIAL_ALLOC);
+        let asked = Self::needed(g, bump);
         // `BufferSize` counts bytes in a `u32`.
         let max_bytes = pool_size_class_below(max_bytes.min(u32::MAX as u64));
         let cap = |elem_bytes: usize| (max_bytes / elem_bytes as u64) as u32;
@@ -421,7 +439,7 @@ impl BumpSizes {
         let coarse = f & STAGE_COARSE != 0;
         let lines = grow(
             had.lines,
-            bump.lines,
+            asked.lines,
             f & STAGE_FLATTEN != 0,
             size_of::<LineSoup>(),
         );
@@ -435,7 +453,7 @@ impl BumpSizes {
         };
         let seg_counts = grow(
             had.seg_counts,
-            bump.seg_counts.max(after_flatten),
+            asked.seg_counts.max(after_flatten),
             f & STAGE_PATH_COUNT != 0,
             size_of::<SegmentCount>(),
         );
@@ -443,14 +461,14 @@ impl BumpSizes {
             lines,
             binning: grow(
                 had.binning,
-                bump.binning,
+                asked.binning,
                 f & STAGE_BINNING != 0,
                 size_of::<u32>(),
             )
             .min(cap_binning),
             tiles: grow(
                 had.tiles,
-                bump.tile,
+                asked.tiles,
                 f & STAGE_TILE_ALLOC != 0,
                 size_of::<Tile>(),
             ),
@@ -458,22 +476,17 @@ impl BumpSizes {
             // Segments are allocated one per counted segment.
             segments: grow(
                 had.segments,
-                bump.segments.max(seg_counts),
+                asked.segments.max(seg_counts),
                 false,
                 size_of::<PathSegment>(),
             ),
             blend: grow(
                 had.blend,
-                bump.blend,
-                coarse && bump.blend > had.blend,
+                asked.blend,
+                coarse && asked.blend > had.blend,
                 size_of::<u32>(),
             ),
-            ptcl: grow(
-                had.ptcl,
-                ptcl_static.saturating_add(bump.ptcl),
-                coarse,
-                size_of::<u32>(),
-            ),
+            ptcl: grow(had.ptcl, asked.ptcl, coarse, size_of::<u32>()),
         }
     }
 }
@@ -751,6 +764,35 @@ mod bump_sizes_tests {
             .gpu;
         assert_eq!(kept.lines_size, 1 << 21);
         assert_eq!(kept.ptcl_size, 1 << 23);
+    }
+
+    #[test]
+    fn what_a_frame_needed_is_its_counters_with_the_command_list_s_static_part() {
+        let g = config(32, 16);
+        let bump = BumpAllocators {
+            lines: 1,
+            binning: 2,
+            tile: 3,
+            seg_counts: 4,
+            segments: 5,
+            blend: 6,
+            ptcl: 7,
+            ..Default::default()
+        };
+        let needed = BumpSizes::needed(&g, &bump);
+        assert_eq!(
+            needed,
+            BumpSizes {
+                lines: 1,
+                binning: 2,
+                tiles: 3,
+                seg_counts: 4,
+                segments: 5,
+                blend: 6,
+                // Two tiles of the target, 64 words reserved in each.
+                ptcl: 2 * 64 + 7,
+            }
+        );
     }
 
     #[test]

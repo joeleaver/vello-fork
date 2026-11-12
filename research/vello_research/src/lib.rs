@@ -120,9 +120,14 @@ mod scene;
 mod shaders;
 
 #[cfg(feature = "wgpu")]
+mod bump_report;
+#[cfg(feature = "wgpu")]
 pub mod util;
 #[cfg(feature = "wgpu")]
 mod wgpu_engine;
+
+#[cfg(feature = "wgpu")]
+pub use bump_report::BumpReport;
 
 pub mod low_level {
     //! Utilities which can be used to create an alternative Vello renderer to [`Renderer`][crate::Renderer].
@@ -348,6 +353,8 @@ pub struct Renderer {
     /// A frame was found to have overflowed, and [`Renderer::check_frames`]
     /// has not said so yet.
     frame_lost: bool,
+    /// The [`BumpReport`]s kept since [`Renderer::record_bump_reports`].
+    bump_reports: bump_report::Recorder,
     #[cfg(feature = "debug_layers")]
     debug: debug::DebugRenderer,
     #[cfg(feature = "wgpu-profiler")]
@@ -467,6 +474,8 @@ struct BumpReadback {
     mapped: Arc<OnceLock<bool>>,
     /// The config the frame was recorded with.
     config: ConfigUniform,
+    /// Its scene's deepest nesting of clips and layers, for a [`BumpReport`].
+    max_open_clips: u32,
 }
 
 /// The largest buffer a bump allocation can use on `device`.
@@ -522,6 +531,7 @@ impl Renderer {
             bump_readbacks: VecDeque::with_capacity(MAX_BUMP_READBACKS),
             bump_readback_limit: MAX_BUMP_READBACKS,
             frame_lost: false,
+            bump_reports: bump_report::Recorder::default(),
             #[cfg(feature = "debug_layers")]
             debug,
             #[cfg(feature = "wgpu-profiler")]
@@ -639,7 +649,7 @@ impl Renderer {
             }
         }
         if robust {
-            self.queue_bump_readback(bump_buf, gpu_config);
+            self.queue_bump_readback(bump_buf, gpu_config, scene.encoding().max_open_clips);
         }
         Ok(())
     }
@@ -667,6 +677,24 @@ impl Renderer {
         }
     }
 
+    /// Keep a [`BumpReport`] of each frame whose counters
+    /// [`Self::check_frames`] takes in from now on, at most `capacity` of
+    /// them (the newest), until [`Self::take_bump_reports`] drains them. 0
+    /// stops and drops those kept. Off by default; off, nothing is kept.
+    ///
+    /// Only frames of the robust path report: on the GPU, not `use_cpu`, not
+    /// on WebAssembly. For measuring the rules that size the buffers
+    /// ([`vello_encoding::BumpSizes::initial`]).
+    pub fn record_bump_reports(&mut self, capacity: usize) {
+        self.bump_reports.set_capacity(capacity);
+    }
+
+    /// The [`BumpReport`]s kept since the last take, oldest first. Recording
+    /// goes on; this only drains.
+    pub fn take_bump_reports(&mut self) -> Vec<BumpReport> {
+        self.bump_reports.take()
+    }
+
     /// Limits the frames whose counters can be on their way back, so that a
     /// test can have one pushed out without outrunning the GPU 64 times.
     #[doc(hidden)]
@@ -676,7 +704,12 @@ impl Renderer {
 
     /// Starts reading back the counters of a frame that has been submitted.
     /// The answer arrives when the device is next polled.
-    fn queue_bump_readback(&mut self, buf: recording::BufferProxy, config: ConfigUniform) {
+    fn queue_bump_readback(
+        &mut self,
+        buf: recording::BufferProxy,
+        config: ConfigUniform,
+        max_open_clips: u32,
+    ) {
         let Some(download) = self.engine.take_download(buf) else {
             return;
         };
@@ -696,6 +729,7 @@ impl Renderer {
             download,
             mapped,
             config,
+            max_open_clips,
         });
     }
 
@@ -720,6 +754,8 @@ impl Renderer {
                 continue;
             };
             let config = &readback.config;
+            self.bump_reports
+                .record(&bump, config, readback.max_open_clips, max_bytes);
             let (width, height) = (config.target_width, config.target_height);
             let had = vello_encoding::BumpSizes::of(config);
             // What the initial sizes are derived from, beside what the frame
