@@ -108,6 +108,11 @@
     reason = "Deferred, only apply in some feature sets so not expect"
 )]
 
+// A dev-dependency used only by the bind-group cache's GPU tests, which need
+// `wgpu` off WebAssembly: suppress `unused_crate_dependencies` elsewhere.
+#[cfg(all(test, not(all(feature = "wgpu", not(target_arch = "wasm32")))))]
+use pollster as _;
+
 mod debug;
 mod recording;
 mod render;
@@ -1050,10 +1055,9 @@ mod bind_group_cache_tests {
 
     fn gpu() -> (Device, Queue) {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let adapter = pollster::block_on(
-            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
-        )
-        .expect("these tests need a GPU adapter");
+        let adapter =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+                .expect("these tests need a GPU adapter");
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
             .expect("device")
     }

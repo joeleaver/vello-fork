@@ -25,6 +25,10 @@ fn every_shader_carries_the_module_of_its_wgsl() {
             postcard::to_allocvec(&parsed).unwrap(),
             "{name}: the IR is not the module of its WGSL"
         );
-        assert_eq!(&*postcard::to_allocvec(&parsed).unwrap(), &*shader.naga_ir, "{name}");
+        assert_eq!(
+            &*postcard::to_allocvec(&parsed).unwrap(),
+            &*shader.naga_ir,
+            "{name}"
+        );
     }
 }
